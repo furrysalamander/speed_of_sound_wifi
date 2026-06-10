@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "speed-of-sound-wifi"
+version = "0.1.0"
+description = "Acoustically coupled data transmission system for baud rate testing"
+requires-python = ">=3.10"
+dependencies = [
+    "sounddevice>=0.5.0",
+    "numpy>=1.24.0",
+    "scipy>=1.11.0",
+    "reedsolo>=1.7.0",
+    "crcmod>=1.7",
+    "PyQt6>=6.6.0",
+    "pyqtgraph>=0.13.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "black>=23.0.0",
+    "flake8>=6.0.0",
+]
+perf = [
+    "pyfftw>=0.13.0",
+]
+
+[project.scripts]
+speed-of-sound = "src.main:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.black]
+line-length = 100

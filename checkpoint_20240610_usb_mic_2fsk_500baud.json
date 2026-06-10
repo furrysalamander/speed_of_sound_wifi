@@ -1,0 +1,37 @@
+{
+  "_comment": "First working loopback test with USB PnP Audio Device",
+  "date": "2024-06-10",
+  "config": {
+    "audio": {
+      "sample_rate": 48000,
+      "buffer_size": 256,
+      "channels": 1,
+      "device_input_index": 19,
+      "device_output_index": 17
+    },
+    "modulation": {
+      "baud_rate": 500,
+      "m_fsk": 2,
+      "freq_min": 200,
+      "freq_max": 4000
+    },
+    "fec": {
+      "enabled": true,
+      "nsym": 32
+    },
+    "frame": {
+      "payload_size": 64
+    }
+  },
+  "result": {
+    "status": "PASS",
+    "symbols": [0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1],
+    "preamble_hex": "5555555555555555",
+    "sync_hex": "aa55aa55aa55aa55",
+    "payload_sent": 64,
+    "payload_received": 64,
+    "throughput_bps": 74.0,
+    "elapsed_s": 6.92
+  },
+  "notes": "2-FSK at 500 baud with 200-4000 Hz range works reliably via USB mic. Preamble and sync pattern detected correctly."
+}

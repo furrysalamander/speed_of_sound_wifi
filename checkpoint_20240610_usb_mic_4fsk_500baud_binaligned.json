@@ -1,0 +1,16 @@
+{
+  "_comment": "4-FSK 500 baud bin-aligned (750-2750 Hz: tones at 1000,1500,2000,2500 Hz). Preamble detects perfectly but data symbols have errors.",
+  "date": "2024-06-10",
+  "status": "PASS (preamble), FAIL (data)",
+  "config": {
+    "audio": { "sample_rate": 48000, "device_input_index": 19, "device_output_index": 17 },
+    "modulation": { "baud_rate": 500, "m_fsk": 4, "freq_min": 750, "freq_max": 2750 },
+    "fec": { "enabled": true, "nsym": 32 }
+  },
+  "result": {
+    "preamble_symbols": [0, 3, 0, 3, 0, 3, 0, 3, 0, 3, 0, 3, 0, 3, 0, 3, 0, 3, 0, 3],
+    "preamble_hex": "3333333333333333",
+    "data_corrupted": "sync pattern not found in decoded bytes"
+  },
+  "notes": "Bin-aligned frequencies (750-2750 Hz, 500 Hz/bin) produce correct preamble detection for 4-FSK. Data corruption likely due to non-flat USB mic frequency response across 1000-2500 Hz range."
+}

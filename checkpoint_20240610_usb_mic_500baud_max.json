@@ -1,0 +1,18 @@
+{
+  "_comment": "2-FSK 500 baud 200-4000 Hz works reliably with USB mic. Higher baud rates cause sporadic bit errors on the 3050 Hz tone. USB mic's usable frequency range: ~200-3000 Hz (rolls off above 3000 Hz).",
+  "date": "2024-06-10",
+  "status": "RELIABLE at 500 baud 2-FSK",
+  "config": {
+    "baud_rate": 500,
+    "m_fsk": 2,
+    "freq_min": 200,
+    "freq_max": 4000,
+    "threshold": 0.03
+  },
+  "results": {
+    "64B_payload": {"status": "PASS", "throughput_bps": 74},
+    "next": "Test 223B payload (fits 1 RS block) for ~279 bps throughput"
+  },
+  "max_reliable_baud": 500,
+  "notes": "Soft sync search threshold: 5/8 bytes matching. Detection threshold: 0.03. Higher baud rates fail due to FFT bin spacing at 64-48 samples."
+}
