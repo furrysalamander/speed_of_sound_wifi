@@ -38,6 +38,12 @@ class FskDemodulator:
         self._sample_count: int = 0
         self._needs_resync: bool = True
 
+        # Threshold for Goertzel energy detection (empirical, tune for your setup)
+        self._detect_threshold: float = 0.05
+
+        # Debug counter
+        self._debug_symbol_count: int = 0
+
         # Stats
         self._total_symbols: int = 0
         self._sync_count: int = 0
@@ -91,11 +97,30 @@ class FskDemodulator:
                         break
 
                 if best_phi != -1:
-                    logger.info(f"Symbol synchronization at offset {best_phi}")
+                    # Refine: find offset that maximizes tone 0 purity in first symbol
+                    # and tone M-1 purity in second symbol (product of energy ratios).
+                    aligned_phi = best_phi
+                    best_purity = 0.0
+                    lo = self._fsk_freqs[0]
+                    hi = self._fsk_freqs[-1]
+                    n = symbol_samples
+                    search_start = max(0, best_phi - n)
+                    search_end = min(len(buf_arr) - 2 * n, best_phi + n)
+                    for delta in range(search_start, search_end):
+                        e0 = self._goertzel_energy(buf_arr[delta:delta+n], lo)
+                        e1 = self._goertzel_energy(buf_arr[delta+n:delta+2*n], hi)
+                        # Also get cross-terms to measure purity
+                        e0_cross = self._goertzel_energy(buf_arr[delta:delta+n], hi)
+                        e1_cross = self._goertzel_energy(buf_arr[delta+n:delta+2*n], lo)
+                        purity = (e0 / (e0_cross + 1e-10)) * (e1 / (e1_cross + 1e-10))
+                        if purity > best_purity:
+                            best_purity = purity
+                            aligned_phi = delta
+
+                    logger.info(f"Preamble alignment: best={aligned_phi} (purity={best_purity:.1f})")
                     self._needs_resync = False
                     self._sync_count += 1
-                    # Discard samples before best_phi
-                    for _ in range(best_phi):
+                    for _ in range(aligned_phi):
                         self._buffer.popleft()
                 else:
                     # Fallback: if first chunk has high energy, use phi=0
@@ -167,51 +192,62 @@ class FskDemodulator:
                 transitions += 1
         return transitions >= len(symbols) - 1
 
+    def _goertzel_detect(self, symbol_data: np.ndarray, debug: bool = False) -> Optional[int]:
+        """Detect symbol using Goertzel/DFT-at-exact-frequency approach.
+
+        Computes the DTFT energy at each tone frequency directly,
+        avoiding FFT bin quantization issues at short symbol lengths.
+        """
+        n = len(symbol_data)
+        signal = symbol_data - np.mean(symbol_data)
+
+        # Hann window for sidelobe suppression
+        hann = 0.5 - 0.5 * np.cos(2 * np.pi * np.arange(n) / n)
+        windowed = signal * hann
+
+        best_energy = 0.0
+        best_symbol = 0
+        energies = []
+
+        for i, freq in enumerate(self._fsk_freqs):
+            omega = 2.0 * np.pi * freq / self._sample_rate
+            cos_ref = np.cos(omega * np.arange(n))
+            sin_ref = np.sin(omega * np.arange(n))
+
+            I = np.sum(windowed * cos_ref)
+            Q = np.sum(windowed * sin_ref)
+            energy = I * I + Q * Q
+            energies.append(energy)
+
+            if energy > best_energy:
+                best_energy = energy
+                best_symbol = i
+
+        if debug:
+            logger.debug("  energies: %s -> sym %d", [f"{e:.4f}" for e in energies], best_symbol)
+
+        if best_energy < self._detect_threshold:
+            return None
+        return best_symbol
+
+    def _goertzel_energy(self, signal: np.ndarray, freq: float) -> float:
+        """Compute Goertzel energy at a specific frequency."""
+        n = len(signal)
+        s = signal - np.mean(signal)
+        hann = 0.5 - 0.5 * np.cos(2 * np.pi * np.arange(n) / n)
+        w = s * hann
+        omega = 2.0 * np.pi * freq / self._sample_rate
+        I = np.sum(w * np.cos(omega * np.arange(n)))
+        Q = np.sum(w * np.sin(omega * np.arange(n)))
+        return I * I + Q * Q
+
     def _detect_symbol(self, symbol_data: np.ndarray) -> Optional[int]:
         """Detect which FSK symbol is present in a symbol period.
 
-        Uses FFT-based detection with correlation to expected frequencies.
-        Returns None if peak magnitude is below threshold (silence/noise).
-
-        Args:
-            symbol_data: Audio samples for one symbol period.
-
-        Returns:
-            Detected symbol index (0 to M-1), or None if detection failed.
+        Uses DTFT-at-exact-frequency (Goertzel-like) detection.
+        Returns None if peak energy is below threshold (silence/noise).
         """
-        # Apply window to reduce spectral leakage
-        window = windows.hann(len(symbol_data), sym=False).astype(np.float32)
-        windowed = symbol_data * window
-
-        # Compute FFT
-        fft_result = np.fft.rfft(windowed)
-        magnitudes = np.abs(fft_result)
-
-        # Convert frequencies to FFT bin indices
-        freq_resolution = self._sample_rate / len(symbol_data)
-
-        best_symbol = 0
-        best_magnitude = 0.0
-
-        for i, freq in enumerate(self._fsk_freqs):
-            # Find the FFT bin closest to this frequency
-            bin_idx = int(round(freq / freq_resolution))
-            bin_idx = max(0, min(bin_idx, len(magnitudes) - 1))
-
-            # Look at the bin and neighbors for better accuracy
-            start_bin = max(0, bin_idx - 1)
-            end_bin = min(len(magnitudes), bin_idx + 2)
-            local_max = np.max(magnitudes[start_bin:end_bin])
-
-            if local_max > best_magnitude:
-                best_magnitude = local_max
-                best_symbol = i
-
-        # Threshold to reject silence/noise
-        if best_magnitude < 0.05:
-            return None
-
-        return best_symbol
+        return self._goertzel_detect(symbol_data)
 
     def detect_sync_preamble(self, samples: np.ndarray, min_len: int = 128) -> bool:
         """Detect the sync preamble in incoming samples.

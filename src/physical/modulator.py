@@ -22,12 +22,14 @@ class FskModulator:
     The modulator maintains phase continuity between symbols to avoid clicks.
     """
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, tone_compensation: Optional[list] = None):
         self.config = config
         self._phase: float = 0.0  # maintain phase continuity
         self._fsk_freqs = config.fsk_frequencies
         self._bits_per_symbol = config.bits_per_symbol
         self._symbol_duration_samples = config.symbol_duration_samples
+        # Optional per-tone amplitude compensation to flatten mic frequency response
+        self._tone_comp = tone_compensation
 
     def modulate_bytes(self, data: bytes) -> np.ndarray:
         """Convert bytes to an FSK-modulated audio signal.
@@ -105,6 +107,10 @@ class FskModulator:
 
             # Generate tone with phase continuity
             tone = np.sin(2 * np.pi * freq * t + self._phase).astype(np.float32)
+
+            # Apply per-tone amplitude compensation if configured
+            if self._tone_comp is not None and symbol_idx < len(self._tone_comp):
+                tone = tone * self._tone_comp[symbol_idx]
 
             # Apply window to reduce spectral leakage
             window = windows.hann(symbol_samples, sym=False).astype(np.float32)

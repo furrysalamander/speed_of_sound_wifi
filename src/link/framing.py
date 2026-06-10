@@ -130,7 +130,7 @@ class FrameParser:
                     if score > best_score:
                         best_score = score
                         best_idx = i
-                if best_score >= 5:  # at least 5 of 8 bytes match
+                if best_score >= 4:  # at least 4 of 8 bytes match
                     sync_idx = best_idx
                 else:
                     # No sync found, clear buffer
@@ -180,48 +180,62 @@ class FrameParser:
                     ]
                 )
 
-                # Verify CRC
-                if verify_crc32_bytes(fec_data, crc_bytes):
-                    # CRC valid, decode FEC
-                    decoded_data, fec_ok = self.fec.decode(fec_data)
-                    self._frames_received += 1
-
+                # Verify CRC — if it fails, try FEC correction first
+                if not verify_crc32_bytes(fec_data, crc_bytes):
+                    # CRC failed on raw data — try FEC correction then re-verify
+                    corrected_raw, fec_ok = self.fec.decode(fec_data)
                     if fec_ok:
-                        self._frames_valid += 1
-                    else:
-                        self._frames_fec_fail += 1
-
-                    # Parse header
-                    if len(decoded_data) >= HEADER_SIZE:
-                        header_byte0 = decoded_data[0]
-                        header_byte1 = decoded_data[1]
-                        header_byte2 = decoded_data[2]
-                        header_byte3 = decoded_data[3]
-
-                        frame_type = (header_byte0 >> 4) & 0x0F
-                        payload_length = ((header_byte0 & 0x0F) << 8) | header_byte1
-                        seq_number = (header_byte2 << 8) | header_byte3
-
-                        # Extract payload
-                        payload_end = HEADER_SIZE + payload_length
-                        if payload_end <= len(decoded_data):
-                            payload = decoded_data[HEADER_SIZE:payload_end]
-                            frames.append((payload, seq_number, frame_type, True))
+                        # Re-encode to compare CRC against corrected RS block
+                        re_encoded = self.fec.encode(corrected_raw)
+                        if verify_crc32_bytes(re_encoded, crc_bytes):
+                            fec_data = re_encoded  # use corrected data
                         else:
-                            logger.warning(
-                                f"Payload length {payload_length} exceeds decoded data length"
-                            )
                             self._frames_crc_fail += 1
+                            continue
                     else:
-                        logger.warning("Header too short")
                         self._frames_crc_fail += 1
+                        continue
 
-                    # Advance buffer past this frame
-                    self._buffer = self._buffer[total_frame_size:]
-                    parsed = True
-                    break
+                # CRC valid (raw or FEC-corrected), decode FEC
+                decoded_data, fec_ok = self.fec.decode(fec_data)
+                self._frames_received += 1
+
+                if fec_ok:
+                    self._frames_valid += 1
                 else:
+                    self._frames_fec_fail += 1
+
+                # Parse header
+                if len(decoded_data) >= HEADER_SIZE:
+                    header_byte0 = decoded_data[0]
+                    header_byte1 = decoded_data[1]
+                    header_byte2 = decoded_data[2]
+                    header_byte3 = decoded_data[3]
+
+                    frame_type = (header_byte0 >> 4) & 0x0F
+                    payload_length = ((header_byte0 & 0x0F) << 8) | header_byte1
+                    seq_number = (header_byte2 << 8) | header_byte3
+
+                    # Extract payload
+                    payload_end = HEADER_SIZE + payload_length
+                    if payload_end <= len(decoded_data):
+                        payload = decoded_data[HEADER_SIZE:payload_end]
+                        frames.append((payload, seq_number, frame_type, True))
+                    else:
+                        logger.warning(
+                            f"Payload length {payload_length} exceeds decoded data length"
+                        )
+                        self._frames_crc_fail += 1
+                else:
+                    logger.warning("Header too short")
                     self._frames_crc_fail += 1
+
+                # Advance buffer past this frame
+                self._buffer = self._buffer[total_frame_size:]
+                parsed = True
+                break
+            else:
+                self._frames_crc_fail += 1
 
             if not parsed:
                 # Could not parse frame, skip one byte after sync and retry
