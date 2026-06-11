@@ -258,8 +258,16 @@ python examples/test_streaming.py --input /tmp/test.bin \
 # Multi-burst pipe test (subprocess, OTA)
 python examples/test_stream_pipe.py
 
+# Single-burst streaming test (OTA, USB mic)
+python examples/test_streaming.py --input /tmp/test.bin \
+  --input-name USB_PnP --output-name analog-stereo \
+  --frames-per-burst 10
+
+# Multi-burst pipe test (subprocess, OTA)
+python examples/test_stream_pipe.py
+
 # OTA demo pipeline (RX -> ffplay)
-python -m examples.demo_pipeline --input /tmp/shrek_10f.bin
+python -m examples.demo_pipeline --input /tmp/shrek_10f_442.bin
 
 # Single-burst TX only
 python -m examples.demo_tx --input /tmp/test.bin --input-name analog-stereo
@@ -276,12 +284,23 @@ python -m examples.demo_rx --output-name USB_PnP | ffplay -i pipe:0 -an -nodisp
 - **Data rate**: 70 bits/symbol → ~1.23 kB/s (9.84 kbps) effective after RS(255,223) + framing (payload_size=442)
 - **Output amplitude**: 0.08 peak (default) — avoids USB mic AGC clipping in the first burst
 
-### Single-Burst Mode (Working)
-Reads entire input, assembles all frames, modulates as **one** OFDM burst with a single preamble, plays continuously. Tested up to 10 frames (4420 B, 3.6s audio, 600 data syms) with 100% reliability via OTA path.
+### Per-Frame Preamble Mode (June 2026)
+
+Instead of one preamble for the entire burst, **each frame gets its own preamble** (4 OFDM syms). This solves both PLL drift and AGC problems:
+
+| Problem | Single-Burst | Per-Frame Preamble |
+|---------|-------------|-------------------|
+| PLL drift | Uncorrectable after ~600 syms | Resets every 60 syms → unlimited |
+| USB mic AGC | 8-10× gain reduction between bursts | Continuous audio → AGC never adjusts |
+| Max reliable frames | ~10 (600 syms) | 19+ (1140+ syms verified) |
+
+**Overhead**: 4 preamble syms per 64 total = 6.25%. Effective rate: ~9.2 kbps (still above 8.5 kbps target).
 
 **Reliability Boundary**:
-- **10 frames (600 data syms, 4420 B)**: reliable (3/3 runs verified)
-- **11 frames (660 data syms, 4862 B)**: marginal (passing RS(32) limit)
+- **10 frames (600 data syms)**: 100% (3/3)
+- **20 frames (1200 data syms)**: 19/20 (loss of ~1 frame due to AGC startup)
+- **25 frames (1500 data syms)**: 24/25
+- **30 frames (1800 data syms)**: 29/30
 - **14+ frames (840+ data syms)**: unreliable — PLL phase drift exceeds RS(32) correction
 
 **Limitations**:
@@ -345,21 +364,32 @@ data = data[:max_payload]
 data += b'\\x00' * (max_payload - len(data))
 open('/tmp/shrek_10f_442.bin', 'wb').write(data)
 "
+
+# Longer clip (30s, ~73 frames):
+ffmpeg -ss 0 -t 30 -i absolute_smallest_shrek_v2_stripped.webm -c copy /tmp/shrek_30s.webm
+python -c "
+data = open('/tmp/shrek_30s.webm', 'rb').read()
+payload_size = 442
+n = (len(data) + payload_size - 1) // payload_size
+data += b'\\x00' * (n * payload_size - len(data))
+open('/tmp/shrek_30s_442.bin', 'wb').write(data)
+"
 ```
 
 ### Next Steps
 1. ✅ **ffplay pipeline** — `demo_rx | ffplay -i pipe:0` for live video demo
 2. ✅ **Short demo clip** — 4s WebM clip (3962 B, 9 frames = 3978 B within reliable limit)
 3. ✅ **Throughput optimization** — payload_size=442 (84.7% framing efficiency vs 42.7%), effective 9.84 kbps
-4. 🔲 **Continuous pilot tone** — send unmodulated carrier during gaps to lock AGC
-5. 🔲 **Pre-emphasis** — start first burst at low amplitude, ramp up for subsequent bursts
-6. 🔲 **Further throughput** — CP=16 (176 Hz sym rate), more subcarriers
+4. ✅ **Per-frame preamble** — replaces shared preamble, solves PLL drift and AGC adaptation
+5. 🔲 **Longer demo** — prepare 30-60s clip (73-145 frames) and test full playback
+6. 🔲 **Full-file streaming** — on-the-fly audio generation for the 90-min Shrek file
+7. 🔲 **Further throughput** — CP=16 (176 Hz sym rate), more subcarriers
 
 ### Relevant Files
 - `src/physical/ofdm.py` — OFDM modem. Channel threshold 0.01, CFO clamp ±0.05 (was ±0.5), PLL β=0.08, leak=0.999, slope clip ±0.02
 - `src/config.py` — `ModulationConfig.output_amplitude=0.08`, `OfdmConfig`: CP=32, SC=9–43, no pilots, QPSK, FFT=256, preamble=4. `FrameConfig.payload_size=442`
-- `examples/demo_tx.py` — Single-burst TX: reads file, frames, modulates, plays, exits
-- `examples/demo_rx.py` — Single-burst RX: listens for preamble, demodulates all symbols, parses frames, writes payload to stdout
+- `examples/demo_tx.py` — Per-frame preamble TX: reads file, frames, each with own preamble, plays, exits
+- `examples/demo_rx.py` — Continuous per-frame RX: detects preambles, demodulates each frame, writes payload to stdout
 - `examples/demo_pipeline.py` — Convenience launcher: starts RX + optional ffplay, runs TX, waits, cleans up
 - `examples/stream_tx_continuous.py` — Zero-gap TX (appends no silence between bursts)
 - `examples/stream_rx.py` — Streaming RX with safety-margin consumption (margin=4)
