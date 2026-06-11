@@ -4,7 +4,9 @@ Captures microphone audio, continuously detects per-frame preambles,
 demodulates each frame, parses frames, and writes payload bytes to stdout.
 """
 
+import json
 import logging
+import os
 import signal
 import sys
 import time
@@ -36,7 +38,7 @@ def frame_data_syms(config):
     return (frame_bytes * 8 + bits_per_sym - 1) // bits_per_sym
 
 
-def demo_rx(config, output_file=None):
+def demo_rx(config, output_file=None, save_failures_dir=None):
     demod = OfdmDemodulator(config)
     parser = FrameParser(config)
     sym_len = demod.sym_samples
@@ -52,6 +54,8 @@ def demo_rx(config, output_file=None):
     n_frames = 0
     search_pos = 0
     running = True
+
+    fail_meta = []
 
     def shutdown(_signum=None, _frame=None):
         nonlocal running
@@ -124,15 +128,35 @@ def demo_rx(config, output_file=None):
             if success:
                 search_pos = abs_pos + frame_samples
             else:
-                logger.warning("Frame fail at t=%.1fs (npk=%.3f, n=%d)",
+                logger.warning("Frame fail at t=%.1fs (npk=%.4f, n=%d)",
                                time.time() - t0, npk, n_frames)
                 search_pos = abs_pos + frame_samples
+
+            if save_failures_dir and not success:
+                meta = {
+                    "npk": round(npk, 6),
+                    "peak_idx": int(peak),
+                    "search_pos": int(search_pos - frame_samples),
+                    "abs_pos": int(abs_pos),
+                    "t_abs": round(time.time() - t0, 3),
+                }
+                fname = f"fail_{n_frames:04d}.npy"
+                np.save(os.path.join(save_failures_dir, fname), chunk)
+                meta["audio_file"] = fname
+                fail_meta.append(meta)
 
     finally:
         output_stream.flush()
         stream.stop()
         if output_file:
             output_stream.close()
+        if save_failures_dir and fail_meta:
+            jpath = os.path.join(save_failures_dir, "metadata.json")
+            with open(jpath, "w") as f:
+                json.dump(fail_meta, f, indent=2)
+            np.save(os.path.join(save_failures_dir, "full_recording.npy"), buf)
+            logger.info("Saved %d failure records to %s",
+                        len(fail_meta), save_failures_dir)
         logger.info("RX done: %d bytes, %d frames in %.1fs",
                     total_received, n_frames, time.time() - t0)
 
@@ -143,10 +167,12 @@ if __name__ == "__main__":
     parser.add_argument("--output", help="Output file (default: stdout)")
     parser.add_argument("--output-name", default="USB_PnP",
                         help="Input device name")
+    parser.add_argument("--save-failures", default=None,
+                        help="Directory to save failure audio and full recording")
     args = parser.parse_args()
 
     c = Config()
     c.modulation.use_ofdm = True
     c.audio.device_input_name = args.output_name
 
-    demo_rx(c, args.output)
+    demo_rx(c, args.output, args.save_failures)

@@ -40,7 +40,7 @@ class OfdmConfig:
     subcarrier_max: int = 69  # last active subcarrier (12937 Hz, -3dB rolloff)
     bits_per_subcarrier: int = 2  # QPSK (2 bits/subcarrier)
     pilot_subcarriers: tuple = ()  # no pilots; DD tracking sufficient with scrambler
-    preamble_symbols: int = 4  # number of OFDM symbols in preamble (more = better channel estimate)
+    preamble_symbols: int = 4  # number of OFDM symbols in preamble
 
 
 @dataclass
