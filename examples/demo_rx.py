@@ -82,27 +82,40 @@ def demo_rx(config, output_file=None, save_failures_dir=None):
             if len(buf) < search_pos + frame_samples:
                 continue
 
-            search_buf = buf[search_pos:]
-            xcorr = np.convolve(search_buf, demod._preamble_audio[::-1],
-                                mode="valid")
-            xcorr_abs = np.abs(xcorr)
-            peak = int(np.argmax(xcorr_abs))
-            pe = float(np.dot(demod._preamble_audio, demod._preamble_audio))
-            if pe < 1e-10:
-                continue
-            seg = search_buf[peak:peak + plen]
-            se = float(np.dot(seg, seg))
-            npk = float(xcorr_abs[peak]) / (np.sqrt(pe * se) + 1e-10)
-            if npk < preamble_thresh:
-                search_pos += int(sym_len * 0.5)
-                continue
-
-            abs_pos = search_pos + peak
-
             margin = int(sym_len * 0.5)
+
+            if n_frames == 0:
+                # Acquisition: search within 1 frame of search_pos to ensure
+                # we find the FIRST frame (not a later stronger one).
+                win = int(frame_samples + sym_len)
+                search_buf = buf[search_pos:search_pos + win]
+                if len(search_buf) < plen:
+                    search_pos += int(sym_len * 0.5)
+                    continue
+                xcorr = np.convolve(search_buf, demod._preamble_audio[::-1],
+                                    mode="valid")
+                xcorr_abs = np.abs(xcorr)
+                peak = int(np.argmax(xcorr_abs))
+                pe = float(np.dot(demod._preamble_audio, demod._preamble_audio))
+                if pe < 1e-10:
+                    continue
+                seg = search_buf[peak:peak + plen]
+                se = float(np.dot(seg, seg))
+                npk = float(xcorr_abs[peak]) / (np.sqrt(pe * se) + 1e-10)
+                if npk < preamble_thresh or se < 0.5:
+                    search_pos += int(sym_len * 0.5)
+                    continue
+                abs_pos = search_pos + peak
+            else:
+                # Tracking: position-based — process_samples handles internal timing
+                abs_pos = search_pos
+                npk = 0.0
+                peak = 0
+
             chunk_start = max(0, abs_pos - margin)
             chunk_end = abs_pos + frame_samples + 4
             if chunk_end > len(buf):
+                # buffer not filled yet — wait for more samples
                 continue
             chunk = buf[chunk_start:chunk_end]
 

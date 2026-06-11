@@ -344,8 +344,8 @@ class OfdmDemodulator:
 
         logger.debug("OFDM: xcorr peak=%f norm=%f", peak_val, norm_peak)
 
-        if norm_peak < 0.10:
-            logger.debug("OFDM: weak correlation (norm=%f < 0.10)", norm_peak)
+        if norm_peak < 0.05:
+            logger.debug("OFDM: weak correlation (norm=%f < 0.05)", norm_peak)
             return None
 
         start_idx = coarse_start + peak_idx
