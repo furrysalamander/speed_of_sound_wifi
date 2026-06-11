@@ -13,6 +13,8 @@ class AudioConfig:
     channels: int = 1  # mono
     device_input_index: Optional[int] = None
     device_output_index: Optional[int] = None
+    device_input_name: Optional[str] = None
+    device_output_name: Optional[str] = None
 
 
 @dataclass
@@ -32,12 +34,12 @@ class OfdmConfig:
     """OFDM modulation configuration."""
 
     fft_size: int = 256
-    cp_length: int = 64  # cyclic prefix samples
-    subcarrier_min: int = 4  # first active subcarrier index (skip DC)
-    subcarrier_max: int = 64  # last active subcarrier index
-    bits_per_subcarrier: int = 2  # BPSK=1, QPSK=2, 16QAM=4
-    pilot_subcarriers: tuple = ()  # subcarrier indices with known pilot symbols
-    preamble_symbols: int = 2  # number of OFDM symbols in preamble
+    cp_length: int = 32  # shorter CP for higher throughput (167 Hz sym rate vs 125)
+    subcarrier_min: int = 9  # first active subcarrier (1687 Hz, past 1500 Hz dip)
+    subcarrier_max: int = 43  # last active subcarrier (8062 Hz, before rolloff)
+    bits_per_subcarrier: int = 2  # BPSK=1, QPSK=2
+    pilot_subcarriers: tuple = ()  # no pilots; DD tracking sufficient with scrambler
+    preamble_symbols: int = 4  # number of OFDM symbols in preamble (more = better channel estimate)
 
 
 @dataclass

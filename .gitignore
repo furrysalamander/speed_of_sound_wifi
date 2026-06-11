@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Environment
+.env
+venv/
+.venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project-specific
+absolute_smallest_shrek_v2_stripped.webm
+launch_opencode.sh
+# STATUS.md

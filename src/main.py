@@ -83,6 +83,14 @@ def parse_args():
         "--output-device", type=int, default=None,
         help="Output device index (use --list-devices to find)"
     )
+    dev_group.add_argument(
+        "--input-name", type=str, default=None,
+        help="Input device name substring (e.g. 'USB_PnP')"
+    )
+    dev_group.add_argument(
+        "--output-name", type=str, default=None,
+        help="Output device name substring (e.g. 'analog-stereo')"
+    )
 
     # Loopback-specific options
     loop_group = parser.add_argument_group("loopback test options")
@@ -126,6 +134,10 @@ def create_config(args) -> Config:
         config.audio.device_input_index = args.input_device
     if args.output_device is not None:
         config.audio.device_output_index = args.output_device
+    if args.input_name is not None:
+        config.audio.device_input_name = args.input_name
+    if args.output_name is not None:
+        config.audio.device_output_name = args.output_name
     if args.no_fec:
         config.fec.enabled = False
 
@@ -204,10 +216,12 @@ def run_loopback(config: Config, payload_size: int = 1024, timeout: float = 15.0
     import numpy as np
 
     from src.audio.loopback import LoopbackTester, LoopbackTestResult
+    from src.audio.devices import resolve_device
 
     logger = logging.getLogger(__name__)
 
-    # Check device configuration
+    # Resolve device name substrings to indices before creating the tester
+    resolve_device(config.audio)
     if config.audio.device_input_index is None or config.audio.device_output_index is None:
         logger.warning("Input or output device not set via --input-device / --output-device")
         logger.warning("Using default system audio devices (may not be correct)")
@@ -242,9 +256,14 @@ def run_loopback(config: Config, payload_size: int = 1024, timeout: float = 15.0
     for baud_rate in baud_rates:
         test_config = Config()
         test_config.modulation.baud_rate = baud_rate
+        test_config.modulation.use_ofdm = config.modulation.use_ofdm
         test_config.modulation.m_fsk = config.modulation.m_fsk
         test_config.modulation.freq_min = config.modulation.freq_min
         test_config.modulation.freq_max = config.modulation.freq_max
+        test_config.ofdm.subcarrier_min = config.ofdm.subcarrier_min
+        test_config.ofdm.subcarrier_max = config.ofdm.subcarrier_max
+        test_config.ofdm.bits_per_subcarrier = config.ofdm.bits_per_subcarrier
+        test_config.ofdm.preamble_symbols = config.ofdm.preamble_symbols
         test_config.fec.enabled = config.fec.enabled
         test_config.fec.nsym = config.fec.nsym
         test_config.audio.device_input_index = config.audio.device_input_index
@@ -253,8 +272,13 @@ def run_loopback(config: Config, payload_size: int = 1024, timeout: float = 15.0
         test_config.audio.buffer_size = config.audio.buffer_size
 
         logger.info("=" * 50)
-        logger.info("LOOPBACK TEST: %d baud, %d-FSK, nsym=%d",
-                     baud_rate, test_config.modulation.m_fsk, test_config.fec.nsym)
+        if test_config.modulation.use_ofdm:
+            logger.info("LOOPBACK TEST: OFDM, SC %d-%d (%d subcarriers), nsym=%d",
+                         test_config.ofdm.subcarrier_min, test_config.ofdm.subcarrier_max,
+                         test_config.ofdm_subcarrier_count, test_config.fec.nsym)
+        else:
+            logger.info("LOOPBACK TEST: %d baud, %d-FSK, nsym=%d",
+                         baud_rate, test_config.modulation.m_fsk, test_config.fec.nsym)
         logger.info("=" * 50)
 
         # Generate deterministic test payload
@@ -277,8 +301,11 @@ def run_loopback(config: Config, payload_size: int = 1024, timeout: float = 15.0
         # Print summary
         status = "PASS" if result.success else "FAIL"
         logger.info("---")
-        logger.info("RESULT [%s]: %d baud, %d-FSK", status, baud_rate,
-                     test_config.modulation.m_fsk)
+        if test_config.modulation.use_ofdm:
+            logger.info("RESULT [%s]: OFDM", status)
+        else:
+            logger.info("RESULT [%s]: %d baud, %d-FSK", status, baud_rate,
+                         test_config.modulation.m_fsk)
         logger.info("  Sync: %s | Frames: %d valid / %d received",
                      "yes" if result.sync_acquired else "no",
                      result.frames_valid, result.frames_received)
@@ -308,12 +335,19 @@ def run_loopback(config: Config, payload_size: int = 1024, timeout: float = 15.0
                 "Baud", "M", "FEC", "Sync?", "Frames", "Bytes", "Throughput")
     logger.info("-" * 70)
     for r in all_results:
-        logger.info("%-6d %-6d %-6s %-8s %-8d %-8d %.1f bps",
-                     r["baud_rate"], r["m_fsk"],
-                     "Y" if r["fec_enabled"] else "N",
-                     "Y" if r["sync_acquired"] else "N",
-                     r["frames_valid"], r["payload_bytes_received"],
-                     r["throughput_bps"])
+        if r.get("use_ofdm"):
+            logger.info("OFDM  %-6s %-6s %-8s %-8d %-8d %.1f bps",
+                         "OFDM", "Y" if r["fec_enabled"] else "N",
+                         "Y" if r["sync_acquired"] else "N",
+                         r["frames_valid"], r["payload_bytes_received"],
+                         r["throughput_bps"])
+        else:
+            logger.info("%-6d %-6d %-6s %-8s %-8d %-8d %.1f bps",
+                         r["baud_rate"], r["m_fsk"],
+                         "Y" if r["fec_enabled"] else "N",
+                         "Y" if r["sync_acquired"] else "N",
+                         r["frames_valid"], r["payload_bytes_received"],
+                         r["throughput_bps"])
     logger.info("=" * 70)
 
 
@@ -346,9 +380,18 @@ def main():
 
     logger.info(f"Speed of Sound WiFi v0.1.0")
     logger.info(f"Sample rate: {config.audio.sample_rate} Hz")
-    logger.info(f"Baud rate: {config.modulation.baud_rate} symbols/sec")
-    logger.info(f"M-FSK: {config.modulation.m_fsk} tones ({config.bits_per_symbol} bits/symbol)")
-    logger.info(f"Freq range: {config.modulation.freq_min}-{config.modulation.freq_max} Hz")
+    if config.modulation.use_ofdm:
+        sub_count = config.ofdm_subcarrier_count
+        sym_rate = config.ofdm_symbol_rate
+        logger.info(f"OFDM: {config.ofdm.subcarrier_min}-{config.ofdm.subcarrier_max} "
+                    f"({sub_count} subcarriers, {config.ofdm.bits_per_subcarrier} bit/sc)")
+        logger.info(f"OFDM param: FFT={config.ofdm.fft_size} CP={config.ofdm.cp_length} "
+                    f"preamble={config.ofdm.preamble_symbols} sym")
+        logger.info(f"Symbol rate: {sym_rate:.1f} Hz, {sym_rate * sub_count * config.ofdm.bits_per_subcarrier:.0f} bps raw")
+    else:
+        logger.info(f"Baud rate: {config.modulation.baud_rate} symbols/sec")
+        logger.info(f"M-FSK: {config.modulation.m_fsk} tones ({config.bits_per_symbol} bits/symbol)")
+        logger.info(f"Freq range: {config.modulation.freq_min}-{config.modulation.freq_max} Hz")
     logger.info(f"FEC: {'Enabled' if config.fec.enabled else 'Disabled'} "
                 f"(RS nsym={config.fec.nsym})")
 

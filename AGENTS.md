@@ -120,22 +120,43 @@ This config works reliably (64-byte payload, 74 bps):
 | Parameter | Value | Notes |
 |-----------|-------|-------|
 | FFT size | 256 | 187.5 Hz subcarrier spacing |
-| CP length | 64 samples | ~1.3 ms guard interval |
-| Active subcarriers | 4-64 (61 total) | 750-12000 Hz band |
-| Subcarrier modulation | QPSK (2 bits) | Gray-coded |
-| Preamble | 2 OFDM symbols | Known QPSK for channel estimation |
-| Symbol duration | 320 samples (6.67 ms) | CP + FFT body |
-| Symbol rate | 150 Hz | 48000/320 |
+| CP length | 128 samples | ~2.7 ms guard interval (longer for better timing margin) |
+| Active subcarriers | 13-42 (30 total) | 2438-7875 Hz (avoids 2250 Hz dip on USB mic) |
+| Subcarrier modulation | BPSK (1 bit) | Preamble uses QPSK for channel estimation |
+| Preamble | 4 OFDM symbols | Known QPSK (more symbols = better channel estimate) |
+| Symbol duration | 384 samples (8 ms) | CP + FFT body |
+| Symbol rate | 125 Hz | 48000/384 |
 
 ### Throughput Estimate
 
 ```
-Raw:         61 subcarriers × 2 bits × 150 Hz = 18,300 bps
-RS-FEC (32): 18,300 × (223/255)              = 16,012 bps
-Framing:     16,012 × (223/271)              ≈ 12,570 bps
+Raw:         30 subcarriers × 1 bit × 125 Hz = 3,750 bps
+RS-FEC (32): 3,750 × (223/255)              = 3,279 bps
+Framing:     3,279 × (223/271)              ≈ 2,699 bps
 ```
 
-Target 7.5 kbps is feasible with >50% margin.
+### Per-Subcarrier Error Profile (USB Mic, Loopback)
+
+| SC Index | Freq | Error Rate | Notes |
+|----------|------|------------|-------|
+| 5 (idx 18) | 3375 Hz | ~2.3% | Occasional errors |
+| 15 (idx 28) | 5250 Hz | ~0.9% | Minor |
+| 18 (idx 31) | 5812 Hz | ~0.6% | Minor |
+| 19 (idx 32) | 6000 Hz | ~1.2% | Minor |
+| 27 (idx 40) | 7500 Hz | ~5.8% | Worst — near roll-off |
+| 28 (idx 41) | 7688 Hz | ~8.5% | Worst — near roll-off |
+
+Subcarriers 12 (2250 Hz, FFT index 22) consistently had ~82% error rate from bad QPSK preamble channel estimate. Subcarriers 27/28 (7500-7688 Hz) have higher errors due to timing drift phase rotation amplified by high frequency.
+
+### Phase Tracking
+
+**Decision-directed phase tracking** (`_dd_common`, `_dd_slope` in OfdmDemodulator):
+- After equalization and BPSK demap, re-encodes decisions and estimates residual phase error per subcarrier
+- Fits linear model (phase = a + b*k, where k = FFT index) to distinguish common phase drift from timing offset
+- Exponential smoothing (alpha=0.05) filters noisy estimates
+- Correction applied to next symbol as `exp(-j*(a + b*k))`
+
+Without DD tracking, block 4 of 5 (last ~68 symbols of 344 total) accumulated ~1.6 samples timing drift, causing 49 byte errors. With DD tracking, block 4 errors dropped to 6-8 (within RS-32 correction limit of 16).
 
 ### Timing Recovery
 
@@ -144,8 +165,58 @@ Uses **preamble cross-correlation** (not CP autocorrelation):
 - Cross-correlates with incoming samples to find preamble start
 - Provides accurate timing even with the raised-cosine onset ramp on the first CP
 
-Channel estimation uses zero-forcing from the 2 known preamble symbols.
+Channel estimation uses zero-forcing from the 4 known preamble symbols.
 One-tap equalization per subcarrier for data symbols.
+
+## QPSK + Pilot Subcarriers
+
+### Implementation (June 2026)
+
+OFDM modem now supports **QPSK data modulation** (2 bits/subcarrier) with **pilot subcarriers** for robust phase tracking:
+
+| Feature | Description |
+|---------|-------------|
+| Data modulation | QPSK (Gray-coded), configurable via `bits_per_subcarrier` |
+| Pilot subcarriers | 4 pilots (indices 0, 10, 20, 29 within active range) carry known QPSK `(1+j)/√2` symbols |
+| Pilot overhead | 4 pilot subcarriers out of 30 active = 52 data bits/symbol (vs 60 raw) |
+| Phase tracking | DD tracking boosted: pilot positions get `max(weight, 2.0)` confidence in weighted LS fit |
+| Pilot symbol override | Demod re-encodes decisions for all SC, but overrides pilot positions with known symbols |
+| Backward compat | BPSK mode still works with or without pilots |
+
+### Throughput (QPSK, 30 SC, CP=128)
+
+```
+Raw:           30 SC × 2 bits × 125 Hz = 7,500 bps
+Pilot overhead: 26 data SC × 2 bits × 125 Hz = 6,500 bps
+RS-FEC (32):   6,500 × (223/255)        = 5,684 bps
+Framing:       5,684 × (223/271)        ≈ 4,679 bps
+```
+
+Still below the 8,506 bps target. Next steps: `cp_length=64` (150 Hz symbol rate), then subcarrier expansion.
+
+### Software Round-Trip (Verified)
+
+```bash
+# QPSK with pilots
+/venv/bin/python -c "
+from src.config import Config; from src.physical.ofdm import *
+c=Config(); c.ofdm.bits_per_subcarrier=2; c.ofdm.pilot_subcarriers=(0,10,20,29)
+audio=OfdmModulator(c).modulate_with_preamble(bytes(range(100)))
+bits=OfdmDemodulator(c).process_samples(audio)
+print('Match:', OfdmDemodulator(c).symbols_to_bytes(bits, 100)[:100]==bytes(range(100)))
+"
+
+# BPSK still works too (with or without pilots)
+```
+
+## Hardware Test Results (USB PnP, Loopback)
+
+| Payload | Valid Frames | Block Errors | Throughput |
+|---------|-------------|--------------|------------|
+| 256 B   | 5/5         | All ≤16      | ~560 bps*  |
+| 1024 B  | 5/5         | All ≤8       | ~2940 bps* |
+
+* Throughput measured as payload / over-the-air time (excludes startup/silence).
 
 ## Commands Summary
 
@@ -157,27 +228,24 @@ python -m pytest tests/ -v
 python -m src.main --headless
 
 # Hardware loopback (USB mic, FSK)
-python tests/test_loopback.py -i 19 -o 17 --payload-size 64 --baud-rate 500 \
-  --freq-min 3000 --freq-max 7000 --m-fsk 2
+python tests/test_loopback.py --input-name USB_PnP --output-name analog-stereo \
+  --payload-size 64 --baud-rate 500 --freq-min 3000 --freq-max 7000 --m-fsk 2
 
 # Hardware loopback (USB mic, 4-FSK)
-python tests/test_loopback.py -i 19 -o 17 --payload-size 128 --baud-rate 500 \
-  --freq-min 3000 --freq-max 9000 --m-fsk 4
+python tests/test_loopback.py --input-name USB_PnP --output-name analog-stereo \
+  --payload-size 128 --baud-rate 500 --freq-min 3000 --freq-max 9000 --m-fsk 4
 
 # Hardware loopback (USB mic, OFDM)
-python tests/test_loopback.py -i 19 -o 17 --ofdm --payload-size 4096
-
-# Hardware loopback with parameter sweep
-python tests/test_loopback.py -i 19 -o 17 --payload-size 128 \
-  --sweep-baud 500 750 --sweep-mfsk 2 4 --output-csv results.csv
-
-# CLI loopback mode (FSK)
-python -m src.main --loopback --input-device 19 --output-device 17 \
-  --payload-size 1024 --baud-rate 2000 --m-fsk 8 --output-csv results.csv
+python tests/test_loopback.py --input-name USB_PnP --output-name analog-stereo \
+  --ofdm --payload-size 1024
 
 # CLI loopback mode (OFDM)
-python -m src.main --loopback --input-device 19 --output-device 17 \
-  --ofdm --payload-size 4096 --output-csv results.csv
+python -m src.main --loopback --input-name USB_PnP --output-name analog-stereo \
+  --ofdm --payload-size 1024 --output-csv results.csv
+
+# CLI loopback mode (FSK)
+python -m src.main --loopback --input-name USB_PnP --output-name analog-stereo \
+  --payload-size 1024 --baud-rate 2000 --m-fsk 8 --output-csv results.csv
 
 # List audio devices
 python -m src.main --list-devices

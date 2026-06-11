@@ -2,6 +2,8 @@
 
 Uses Hermitian-symmetric OFDM (DMT) for real-valued audio output.
 Configurable FFT size, CP length, subcarrier range, and bits per subcarrier.
+Supports BPSK (1 bit/sc) and QPSK (2 bits/sc) with pilot subcarriers
+for continuous phase tracking.
 """
 
 import logging
@@ -16,20 +18,21 @@ logger = logging.getLogger(__name__)
 
 def _qpsk_map(bits: np.ndarray) -> np.ndarray:
     """Map pairs of bits to QPSK complex symbols (Gray-coded)."""
-    symbols = np.zeros(len(bits) // 2, dtype=np.complex64)
-    for i in range(len(symbols)):
+    n = len(bits) // 2
+    sym = np.zeros(n, dtype=np.complex64)
+    for i in range(n):
         b0 = bits[2 * i]
         b1 = bits[2 * i + 1]
-        # Gray code: 00->+1+j, 01->-1+j, 11->-1-j, 10->+1-j
         I = 1.0 if b0 == 0 else -1.0
         Q = 1.0 if b1 == 0 else -1.0
-        symbols[i] = complex(I, Q)
-    return symbols / np.sqrt(2.0)
+        sym[i] = complex(I, Q)
+    return sym / np.sqrt(2.0)
 
 
 def _qpsk_demap(symbols: np.ndarray) -> np.ndarray:
     """Demap QPSK complex symbols back to bits (Gray-coded)."""
-    bits = np.zeros(len(symbols) * 2, dtype=np.uint8)
+    n = len(symbols)
+    bits = np.zeros(n * 2, dtype=np.uint8)
     for i, s in enumerate(symbols):
         bits[2 * i] = 0 if s.real > 0 else 1
         bits[2 * i + 1] = 0 if s.imag > 0 else 1
@@ -60,9 +63,24 @@ class OfdmModulator:
         self.sub_count = self.ofdm_subcarrier_count
         self.bits_per_sc = self.ofdm.bits_per_subcarrier
         self.preamble_symbols = self.ofdm.preamble_symbols
-
-        # Subcarrier spacing
         self.subcarrier_spacing = self.sample_rate / self.fft_size
+
+        # Pilot subcarriers
+        self.pilot_indices = sorted(set(self.ofdm.pilot_subcarriers))
+        self.num_pilots = len(self.pilot_indices)
+        self.data_bits_per_sym = (self.sub_count - self.num_pilots) * self.bits_per_sc
+
+        # Known pilot symbol value
+        if self.bits_per_sc == 1:
+            self._pilot_symbol = complex(1.0, 0.0)
+        else:
+            self._pilot_symbol = (1.0 + 1.0j) / np.sqrt(2.0)
+
+        # Non-pilot subcarrier indices (for placing data)
+        self._data_sc_mask = np.ones(self.sub_count, dtype=bool)
+        self._data_sc_mask[self.pilot_indices] = False
+        self._data_sc_indices = np.where(self._data_sc_mask)[0]
+        self._pilot_sc_indices = np.where(~self._data_sc_mask)[0]
 
         # Preamble: QPSK symbols on all active subcarriers (known sequence)
         rng = np.random.default_rng(seed=42)
@@ -77,14 +95,7 @@ class OfdmModulator:
         return self.sub_max - self.sub_min + 1
 
     def _build_ofdm_symbol(self, fd_data: np.ndarray) -> np.ndarray:
-        """Build a real-valued OFDM symbol from frequency-domain data.
-
-        Args:
-            fd_data: Complex QPSK symbols for active subcarriers (len = sub_count).
-
-        Returns:
-            Time-domain samples (real) of length fft_size + cp_length.
-        """
+        """Build a real-valued OFDM symbol from frequency-domain data."""
         N = self.fft_size
         fd = np.zeros(N, dtype=np.complex64)
 
@@ -92,10 +103,9 @@ class OfdmModulator:
         fd[self.sub_min:self.sub_max + 1] = fd_data
 
         # Hermitian symmetry for real-valued IFFT output
-        # fd[N - k] = conj(fd[k])
         fd[N - self.sub_max:N - self.sub_min + 1] = np.conj(fd_data[::-1])
 
-        # IFFT (ortho-normalized)
+        # IFFT
         td = np.fft.ifft(fd, norm="ortho")
 
         # Add cyclic prefix
@@ -104,24 +114,20 @@ class OfdmModulator:
         return td_with_cp.real.astype(np.float32)
 
     def _extract_ofdm_symbol(self, td: np.ndarray) -> np.ndarray:
-        """Extract frequency-domain data from a real-valued OFDM symbol.
-
-        Args:
-            td: Time-domain samples of one OFDM symbol (CP + FFT), real.
-
-        Returns:
-            Complex QPSK symbols on active subcarriers.
-        """
+        """Extract frequency-domain data from a real-valued OFDM symbol."""
         N = self.fft_size
-        # Remove CP
         body = td[self.cp_length:self.cp_length + N]
-        # FFT
         fd = np.fft.fft(body, norm="ortho")
-        # Extract active subcarriers
         return fd[self.sub_min:self.sub_max + 1]
 
     def modulate_with_preamble(self, data: bytes) -> np.ndarray:
         """Modulate data bytes into an OFDM audio signal with preamble.
+
+        Uses BPSK or QPSK per config. Pilot subcarriers carry known symbols
+        (overriding data) for receiver-side phase tracking.
+
+        Data is XOR-scrambled with a known PRNG pattern before modulation
+        to avoid problematic bit patterns (e.g. alternating 1s/0s in sync).
 
         Args:
             data: Bytes to transmit.
@@ -129,44 +135,60 @@ class OfdmModulator:
         Returns:
             Audio samples (float32) ready for playback.
         """
+        # XOR-scramble with known pattern
+        rng = np.random.default_rng(seed=12345)
+        mask = bytes(rng.integers(0, 256, size=len(data), dtype=np.uint8).tolist())
+        data = bytes(a ^ b for a, b in zip(data, mask))
+
         # Convert bytes to bits
         bits = np.unpackbits(np.frombuffer(data, dtype=np.uint8))
-        # Pad to multiple of bits per symbol
-        bits_per_ofdm_sym = self.sub_count * self.bits_per_sc
-        remainder = len(bits) % bits_per_ofdm_sym
+
+        # Pad to multiple of data_bits_per_sym
+        remainder = len(bits) % self.data_bits_per_sym
         if remainder:
-            pad_len = bits_per_ofdm_sym - remainder
-            bits = np.pad(bits, (0, pad_len), mode="constant")
+            bits = np.pad(bits, (0, self.data_bits_per_sym - remainder), mode="constant")
 
-        num_data_syms = len(bits) // bits_per_ofdm_sym
-        # Map bits to QPSK symbols per OFDM symbol
-        fd_symbols = bits.reshape(num_data_syms, bits_per_ofdm_sym)
-        data_sc_symbols = np.array([
-            _qpsk_map(fd_symbols[i]) for i in range(num_data_syms)
+        num_data_syms = len(bits) // self.data_bits_per_sym
+
+        # Map bits to subcarrier symbols (data subcarriers only)
+        fd_symbols = bits.reshape(num_data_syms, self.data_bits_per_sym)
+        _map_fn = _bpsk_map if self.bits_per_sc == 1 else _qpsk_map
+        data_symbols = np.array([_map_fn(fd_symbols[i]) for i in range(num_data_syms)])
+
+        # Insert pilot symbols at pilot subcarrier positions
+        full_symbols = np.zeros((num_data_syms, self.sub_count), dtype=np.complex64)
+        full_symbols[:, self._data_sc_indices] = data_symbols
+        full_symbols[:, self._pilot_sc_indices] = self._pilot_symbol
+
+        # Build preamble
+        preamble_audio = np.concatenate([
+            self._build_ofdm_symbol(self._preamble_sc_symbols[i])
+            for i in range(self.preamble_symbols)
         ])
-
-        # Build preamble (known symbols)
-        preamble_audio = []
-        for i in range(self.preamble_symbols):
-            preamble_audio.append(self._build_ofdm_symbol(self._preamble_sc_symbols[i]))
-        preamble_audio = np.concatenate(preamble_audio)
 
         # Build data symbols
         if num_data_syms > 0:
             data_audio = np.concatenate([
-                self._build_ofdm_symbol(data_sc_symbols[i])
+                self._build_ofdm_symbol(full_symbols[i])
                 for i in range(num_data_syms)
             ])
         else:
             data_audio = np.array([], dtype=np.float32)
 
-        # Apply raised-cosine onset to preamble for smooth start
+        # Raised-cosine onset
         onset_len = min(self.cp_length, len(preamble_audio))
         if onset_len > 0:
             ramp = 0.5 * (1 - np.cos(np.pi * np.arange(onset_len) / onset_len))
             preamble_audio[:onset_len] *= ramp
 
-        return np.concatenate([preamble_audio, data_audio])
+        result = np.concatenate([preamble_audio, data_audio])
+
+        # Normalize
+        max_val = np.max(np.abs(result))
+        if max_val > 0:
+            result = result * (0.9 / max_val)
+
+        return result
 
 
 class OfdmDemodulator:
@@ -185,6 +207,25 @@ class OfdmDemodulator:
         self.preamble_symbols = self.ofdm.preamble_symbols
         self.sym_samples = self.fft_size + self.cp_length
 
+        # Pilot subcarriers
+        self.pilot_indices = sorted(set(self.ofdm.pilot_subcarriers))
+        self.num_pilots = len(self.pilot_indices)
+        self.data_bits_per_sym = (self.sub_count - self.num_pilots) * self.bits_per_sc
+
+        # Known pilot symbol value
+        if self.bits_per_sc == 1:
+            self._pilot_symbol = complex(1.0, 0.0)
+        else:
+            self._pilot_symbol = (1.0 + 1.0j) / np.sqrt(2.0)
+
+        # Non-pilot bit mask (for removing pilot bits from output)
+        pilot_bit_indices = []
+        for p in self.pilot_indices:
+            start = p * self.bits_per_sc
+            pilot_bit_indices.extend(range(start, start + self.bits_per_sc))
+        self._data_bit_mask = np.ones(self.sub_count * self.bits_per_sc, dtype=bool)
+        self._data_bit_mask[pilot_bit_indices] = False
+
         # Preamble in frequency domain (same as modulator)
         rng = np.random.default_rng(seed=42)
         half_bits = self.sub_count * self.preamble_symbols * 2
@@ -196,8 +237,19 @@ class OfdmDemodulator:
         # Preamble time-domain signal (for cross-correlation timing)
         self._preamble_audio = self._generate_preamble_audio()
 
+        # Subcarrier indices (active range) for phase slope computation
+        self._k_all = np.arange(self.sub_min, self.sub_max + 1, dtype=np.float32)
+        self._k_ref = np.mean(self._k_all)
+        self._pilot_k = self._k_all[list(self.pilot_indices)]
+
         # Estimated channel (frequency domain)
         self._channel_est: Optional[np.ndarray] = None
+
+        # Decision-directed phase tracking state
+        self._dd_common = 0.0  # absolute phase correction (radians)
+        self._dd_slope = 0.0  # subcarrier-dependent phase slope (rad/index)
+        self._cfo_freq = 0.0  # CFO frequency (radians per symbol)
+        self._dd_alpha = 0.3  # phase tracking gain
 
     def _generate_preamble_audio(self) -> np.ndarray:
         """Generate the full time-domain preamble signal (same as TX)."""
@@ -223,18 +275,12 @@ class OfdmDemodulator:
         return self.sub_max - self.sub_min + 1
 
     def _estimate_channel(self, symbols: list) -> np.ndarray:
-        """Estimate channel from preamble symbols (zero-forcing).
-
-        Args:
-            symbols: List of preamble OFDM symbols (frequency domain, complex).
-
-        Returns:
-            Channel estimate per active subcarrier.
-        """
+        """Estimate channel from preamble symbols (zero-forcing)."""
         H = np.zeros(self.sub_count, dtype=np.complex64)
-        for i in range(min(len(symbols), self.preamble_symbols)):
+        n = min(len(symbols), self.preamble_symbols)
+        for i in range(n):
             H += symbols[i] / (self._preamble_sc_symbols[i] + 1e-10)
-        H /= min(len(symbols), self.preamble_symbols)
+        H /= n
         return H
 
     def _equalize(self, fd_data: np.ndarray, H: np.ndarray) -> np.ndarray:
@@ -245,12 +291,14 @@ class OfdmDemodulator:
         """Process incoming audio samples and extract symbols.
 
         Uses cross-correlation with stored preamble for robust timing.
+        Applies decision-directed phase tracking per symbol.
 
         Args:
             samples: Audio samples (float32).
 
         Returns:
-            Array of demodulated bits, or None if no valid data.
+            Array of demodulated bits (data subcarriers only, pilot bits removed),
+            or None if no valid data.
         """
         N = self.fft_size
         cp = self.cp_length
@@ -259,26 +307,50 @@ class OfdmDemodulator:
         min_required = preamble_len + sym_len
 
         if len(samples) < min_required:
+            logger.debug("OFDM: too few samples (%d < %d)", len(samples), min_required)
             return None
 
-        # 1. Cross-correlate with stored preamble for timing
-        xcorr = np.convolve(samples, self._preamble_audio[::-1], mode="valid")
+        # 1. Energy-based coarse detection
+        window = min(preamble_len, len(samples))
+        if window < 1:
+            return None
+        energy = np.convolve(samples ** 2, np.ones(window) / window, mode="same")
+        energy_thresh = np.max(energy) * 0.1
+        above = energy > energy_thresh
+        if not np.any(above):
+            logger.debug("OFDM: no energy above threshold")
+            return None
+        coarse_start = max(0, np.argmax(above) - window // 2)
+        search_end = min(len(samples), coarse_start + 2 * preamble_len + sym_len)
+
+        if search_end - coarse_start < preamble_len:
+            logger.debug("OFDM: signal too short after coarse start")
+            return None
+
+        search_region = samples[coarse_start:search_end]
+
+        # 2. Cross-correlation timing
+        xcorr = np.convolve(search_region, self._preamble_audio[::-1], mode="valid")
         peak_idx = int(np.argmax(np.abs(xcorr)))
         peak_val = np.abs(xcorr[peak_idx])
 
-        # Normalize: compute expected energy
         preamble_energy = np.dot(self._preamble_audio, self._preamble_audio)
         if preamble_energy < 1e-10:
             return None
 
-        # Reject weak correlations
-        if peak_val < 0.3 * preamble_energy:
+        corr_window = search_region[peak_idx:peak_idx + preamble_len]
+        signal_energy = np.dot(corr_window, corr_window)
+        norm_peak = peak_val / (np.sqrt(preamble_energy * signal_energy) + 1e-10)
+
+        logger.debug("OFDM: xcorr peak=%f norm=%f", peak_val, norm_peak)
+
+        if norm_peak < 0.15:
+            logger.debug("OFDM: weak correlation (norm=%f < 0.15)", norm_peak)
             return None
 
-        # The peak of the valid cross-correlation is at the start of the preamble
-        start_idx = peak_idx
+        start_idx = coarse_start + peak_idx
 
-        # 2. Extract preamble symbols for channel estimation
+        # 3. Extract preamble symbols
         preamble_fd = []
         for i in range(self.preamble_symbols):
             offset = start_idx + i * sym_len
@@ -288,17 +360,56 @@ class OfdmDemodulator:
             fd = np.fft.fft(sym[cp:cp + N], norm="ortho")
             preamble_fd.append(fd[self.sub_min:self.sub_max + 1])
 
-        # 3. Channel estimation (always re-estimate for new burst)
+        # 4. Channel estimation
         self._channel_est = self._estimate_channel(preamble_fd)
         H = self._channel_est
 
-        # 4. Extract data symbols
+        if np.mean(np.abs(H)) < 0.05:
+            logger.debug("OFDM: channel too weak")
+            return None
+
+        # 5. Estimate CFO from preamble symbols to initialize DD tracking.
+        #    We measure the per-symbol phase rotation (CFO drift) and project
+        #    it to the first data symbol. The static channel phase in H is NOT
+        #    included — we only track the residual DRIFT over symbols.
+        preamble_phases = []
+        for i in range(self.preamble_symbols):
+            pd = preamble_fd[i] / (self._preamble_sc_symbols[i] + 1e-10)
+            preamble_phases.append(np.mean(np.angle(pd)))
+
+        if self.preamble_symbols >= 2:
+            # Extract per-symbol drift from consecutive preamble symbol pairs
+            per_sym_drift = np.mean([
+                np.arctan2(np.sin(preamble_phases[i+1] - preamble_phases[i]),
+                           np.cos(preamble_phases[i+1] - preamble_phases[i]))
+                for i in range(self.preamble_symbols - 1)
+            ])
+            # Store CFO frequency for second-order phase tracking
+            self._cfo_freq = per_sym_drift
+            # Channel estimate H includes the CFO phase at the preamble center
+            # (~symbol 1.5 for 4 preamble symbols). The first data symbol is
+            # at index 4. So the residual phase at first data symbol (after
+            # equalization by H) is (4 - 1.5) * per_sym_drift = 2.5 * per_sym_drift.
+            self._dd_common = per_sym_drift * (self.preamble_symbols - 1.5)
+            self._dd_common = np.arctan2(np.sin(self._dd_common), np.cos(self._dd_common))
+            self._dd_slope = 0.0
+            logger.debug("OFDM: initial dd_common=%.4f cfo_freq=%.4f rad/sym",
+                         self._dd_common, self._cfo_freq)
+        else:
+            self._dd_common = 0.0
+            self._cfo_freq = 0.0
+            self._dd_slope = 0.0
+
+        # 6. Extract all data symbols
         data_offset = start_idx + preamble_len
         num_data = (len(samples) - data_offset) // sym_len
         if num_data == 0:
             return None
 
         all_bits = []
+        _demap_fn = _bpsk_demap if self.bits_per_sc == 1 else _qpsk_demap
+        _map_fn = _bpsk_map if self.bits_per_sc == 1 else _qpsk_map
+
         for i in range(num_data):
             offset = data_offset + i * sym_len
             if offset + sym_len > len(samples):
@@ -306,20 +417,69 @@ class OfdmDemodulator:
             sym = samples[offset:offset + sym_len]
             fd = np.fft.fft(sym[cp:cp + N], norm="ortho")
             fd_active = fd[self.sub_min:self.sub_max + 1]
-            fd_eq = self._equalize(fd_active, H)
-            bits = _qpsk_demap(fd_eq)
-            all_bits.append(bits)
+
+            # Apply phase correction from DD tracking
+            phase_correction = self._dd_common + self._dd_slope * (self._k_all - self._k_ref)
+            fd_corrected = fd_active * np.exp(-1j * phase_correction)
+
+            # Equalize and demap
+            fd_eq = self._equalize(fd_corrected, H)
+            all_sc_bits = _demap_fn(fd_eq)
+
+            # Remove pilot bits -> data bits only
+            data_bits = all_sc_bits[self._data_bit_mask]
+            all_bits.append(data_bits)
+
+            # Phase tracking: weighted LS fit over all subcarriers
+            # Pilots get boosted weight for higher confidence
+            X_hat = _map_fn(all_sc_bits)
+            if self.pilot_indices:
+                for p in self.pilot_indices:
+                    X_hat[p] = self._pilot_symbol
+
+            expected = H * X_hat
+            phase_err = np.angle(fd_corrected / (expected + 1e-10))
+            weights = np.abs(fd_eq)
+            if self.pilot_indices:
+                for p in self.pilot_indices:
+                    weights[p] = max(weights[p], 2.0)
+
+            A_mat = np.column_stack([np.ones_like(self._k_all), self._k_all - self._k_ref])
+            W_mat = np.diag(weights)
+            try:
+                coeffs, *_ = np.linalg.lstsq(W_mat @ A_mat, W_mat @ phase_err, rcond=None)
+                new_common = float(coeffs[0])
+                new_slope = float(coeffs[1])
+
+                # Second-order PLL with frequency integrator
+                beta = 0.03
+                self._cfo_freq += beta * new_common
+                self._cfo_freq = np.clip(self._cfo_freq, -0.5, 0.5)
+                self._dd_common += self._cfo_freq + self._dd_alpha * new_common
+                self._dd_common = np.arctan2(np.sin(self._dd_common),
+                                             np.cos(self._dd_common))
+                self._dd_slope = np.clip(
+                    (1 - self._dd_alpha) * self._dd_slope + self._dd_alpha * new_slope,
+                    -0.05, 0.05
+                )
+            except np.linalg.LinAlgError:
+                pass
 
         if not all_bits:
             return None
 
+        logger.debug("OFDM: decoded %d symbols, %d bits per data sym",
+                     len(all_bits), self.data_bits_per_sym)
         return np.concatenate(all_bits)
 
     def symbols_to_bytes(self, symbols: np.ndarray, original_byte_count: int) -> bytes:
         """Convert demodulated bits back to bytes.
 
+        Applies descrambling (XOR with known PRNG) to undo the TX-side
+        scrambler that prevents problematic bit patterns.
+
         Args:
-            symbols: Array of bits (uint8, 0 or 1).
+            symbols: Array of bits (uint8, 0 or 1) — data subcarrier bits only.
             original_byte_count: Expected number of output bytes.
 
         Returns:
@@ -328,13 +488,18 @@ class OfdmDemodulator:
         total_bits = original_byte_count * 8
         if len(symbols) > total_bits:
             symbols = symbols[:total_bits]
-        # Pad to multiple of 8
         pad = (8 - len(symbols) % 8) % 8
         if pad:
             symbols = np.pad(symbols, (0, pad), mode="constant")
-        byte_array = np.packbits(symbols)
-        return byte_array.tobytes()
+        result = np.packbits(symbols).tobytes()
+        # Descramble (same PRNG pattern as modulator)
+        rng = np.random.default_rng(seed=12345)
+        mask = bytes(rng.integers(0, 256, size=len(result), dtype=np.uint8).tolist())
+        return bytes(a ^ b for a, b in zip(result, mask))
 
     def reset(self):
         """Reset demodulator state (for new transmission)."""
         self._channel_est = None
+        self._dd_common = 0.0
+        self._dd_slope = 0.0
+        self._cfo_freq = 0.0

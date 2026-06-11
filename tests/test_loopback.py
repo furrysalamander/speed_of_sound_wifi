@@ -49,14 +49,16 @@ def parse_args():
     parser.add_argument("--list-devices", action="store_true",
                         help="List audio devices and exit")
 
-    # Required device specification
+    # Device specification
     dev_group = parser.add_argument_group("audio devices (required)")
     dev_group.add_argument("-i", "--input-device", type=int, default=None,
-                           required=True,
                            help="Input device index")
     dev_group.add_argument("-o", "--output-device", type=int, default=None,
-                           required=True,
                            help="Output device index")
+    dev_group.add_argument("--input-name", type=str, default=None,
+                           help="Input device name substring (e.g. 'USB_PnP')")
+    dev_group.add_argument("--output-name", type=str, default=None,
+                           help="Output device name substring (e.g. 'analog-stereo')")
 
     # Modulation parameters
     mod_group = parser.add_argument_group("modulation parameters")
@@ -118,6 +120,8 @@ def build_configs(args) -> list:
             config.fec.nsym = args.nsym
             config.audio.device_input_index = args.input_device
             config.audio.device_output_index = args.output_device
+            config.audio.device_input_name = args.input_name
+            config.audio.device_output_name = args.output_name
             configs.append(config)
     return configs
 

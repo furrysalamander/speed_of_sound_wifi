@@ -1,8 +1,13 @@
 """Audio device enumeration and selection utilities."""
 
-from typing import List, Tuple, Optional
+from __future__ import annotations
+
+from typing import List, Optional, TYPE_CHECKING
 
 import sounddevice as sd
+
+if TYPE_CHECKING:
+    from src.config import AudioConfig
 
 
 class AudioDeviceInfo:
@@ -84,6 +89,46 @@ def get_default_output_device() -> Optional[AudioDeviceInfo]:
         if 0 <= default_index < len(devices):
             return AudioDeviceInfo(devices[default_index], "output")
     return None
+
+
+def find_device_by_name(substring: str, kind: str = "input") -> Optional[AudioDeviceInfo]:
+    """Find a device whose name contains the given substring.
+
+    Args:
+        substring: Substring to match against device names (case-insensitive).
+        kind: 'input', 'output', or 'duplex'.
+
+    Returns:
+        Matching AudioDeviceInfo, or None if not found.
+    """
+    devices = list_devices()
+    sub_lower = substring.lower()
+    for d in devices:
+        if sub_lower in d.name.lower():
+            if kind == "input" and d.max_input_channels > 0:
+                return d
+            if kind == "output" and d.max_output_channels > 0:
+                return d
+            if kind == "duplex" and d.max_input_channels > 0 and d.max_output_channels > 0:
+                return d
+    return None
+
+
+def resolve_device(config: "AudioConfig") -> None:
+    """Resolve device names to indices in-place.
+
+    If device_input_name is set and device_input_index is None, looks up
+    the input device by name substring. Same for output.
+    """
+    if config.device_input_name and config.device_input_index is None:
+        dev = find_device_by_name(config.device_input_name, "input")
+        if dev is not None:
+            config.device_input_index = dev.index
+
+    if config.device_output_name and config.device_output_index is None:
+        dev = find_device_by_name(config.device_output_name, "output")
+        if dev is not None:
+            config.device_output_index = dev.index
 
 
 def print_device_list():

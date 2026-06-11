@@ -12,6 +12,7 @@ import numpy as np
 import sounddevice as sd
 
 from src.config import AudioConfig
+from src.audio.devices import resolve_device
 
 logger = logging.getLogger(__name__)
 
@@ -220,6 +221,9 @@ class AudioStream:
         if self._running:
             logger.warning("Stream already running")
             return
+
+        # Resolve device name substrings to indices before opening streams
+        resolve_device(self.config)
 
         with self._lock:
             try:

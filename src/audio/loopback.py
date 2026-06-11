@@ -99,18 +99,30 @@ class LoopbackTester:
 
         logger.info("Starting loopback test")
         logger.info("  Payload: %d bytes", len(payload))
-        logger.info("  Baud rate: %d sym/s", self.config.modulation.baud_rate)
-        logger.info("  M-FSK: %d (%d bits/symbol)",
-                     self.config.modulation.m_fsk,
-                     self.config.bits_per_symbol)
+        if self.config.modulation.use_ofdm:
+            logger.info("  OFDM: SC %d-%d (%d subcarriers, %d bit/sc)",
+                         self.config.ofdm.subcarrier_min, self.config.ofdm.subcarrier_max,
+                         self.config.ofdm_subcarrier_count, self.config.ofdm.bits_per_subcarrier)
+            logger.info("  OFDM: FFT=%d CP=%d preamble=%d sym",
+                         self.config.ofdm.fft_size, self.config.ofdm.cp_length,
+                         self.config.ofdm.preamble_symbols)
+        else:
+            logger.info("  Baud rate: %d sym/s", self.config.modulation.baud_rate)
+            logger.info("  M-FSK: %d (%d bits/symbol)",
+                         self.config.modulation.m_fsk,
+                         self.config.bits_per_symbol)
+            logger.info("  Freq range: %d-%d Hz",
+                         self.config.modulation.freq_min,
+                         self.config.modulation.freq_max)
         logger.info("  FEC: %s (nsym=%d)",
                      "enabled" if self.config.fec.enabled else "disabled",
                      self.config.fec.nsym)
-        logger.info("  Freq range: %d-%d Hz",
-                     self.config.modulation.freq_min,
-                     self.config.modulation.freq_max)
-        logger.info("  Input device: %s", self.config.audio.device_input_index)
-        logger.info("  Output device: %s", self.config.audio.device_output_index)
+        logger.info("  Input device: idx=%s name=%s",
+                     self.config.audio.device_input_index,
+                     self.config.audio.device_input_name or "default")
+        logger.info("  Output device: idx=%s name=%s",
+                     self.config.audio.device_output_index,
+                     self.config.audio.device_output_name or "default")
 
         # Assemble frame and modulate
         frame = self.assembler.assemble_frame(payload)
@@ -198,6 +210,10 @@ class LoopbackTester:
         else:
             logger.info("  No silence cropping (RX buffer too short)")
 
+        # Use actual frame size for byte estimation
+        frame_size = len(frame)
+        byte_est = frame_size + 64  # margin for extra demodulated samples
+
         # Use appropriate demodulator for mode
         if self.config.modulation.use_ofdm:
             bits = self.demodulator.process_samples(all_rx)
@@ -207,17 +223,6 @@ class LoopbackTester:
                 return result
             result.sync_acquired = True
             logger.info("  Bits: %d total", len(bits))
-            # Compute byte estimate (frame bytes + margin)
-            frame_size_est = 8 + 4 + len(payload) + self.config.fec.nsym + 4
-            if not self.config.fec.enabled:
-                frame_size_est = 8 + 4 + len(payload) + 4
-            rs_block_data = 255 - self.config.fec.nsym
-            if self.config.fec.enabled:
-                data_for_fec = 4 + len(payload)
-                num_blocks = math.ceil(data_for_fec / rs_block_data)
-                fec_size = num_blocks * 255
-                frame_size_est = 8 + fec_size + 4
-            byte_est = frame_size_est + 64
             decoded_bytes = self.demodulator.symbols_to_bytes(bits, byte_est)
         else:
             demod = FskDemodulator(self.config)
@@ -229,16 +234,6 @@ class LoopbackTester:
             result.sync_acquired = True
             logger.info("  Symbols: %d total", len(symbols))
             logger.info("  First 20 symbols: %s", symbols[:20].tolist())
-            frame_size_est = 8 + 4 + len(payload) + self.config.fec.nsym + 4
-            if not self.config.fec.enabled:
-                frame_size_est = 8 + 4 + len(payload) + 4
-            rs_block_data = 255 - self.config.fec.nsym
-            if self.config.fec.enabled:
-                data_for_fec = 4 + len(payload)
-                num_blocks = math.ceil(data_for_fec / rs_block_data)
-                fec_size = num_blocks * 255
-                frame_size_est = 8 + fec_size + 4
-            byte_est = frame_size_est + 64
             decoded_bytes = self.demodulator.symbols_to_bytes(symbols, byte_est)
 
         logger.info("  Decoded %d bytes", len(decoded_bytes))
