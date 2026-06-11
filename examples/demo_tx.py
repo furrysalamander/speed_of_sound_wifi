@@ -1,7 +1,7 @@
-"""Single-burst OFDM transmitter for demo.
+"""Per-frame preamble OFDM transmitter for demo.
 
-Reads a file, assembles all frames, modulates as one OFDM burst
-with a single preamble, plays through speaker, and exits.
+Reads a file, assembles all frames, each with its own preamble,
+plays continuously through speaker, and exits.
 """
 
 import logging
@@ -39,24 +39,24 @@ def demo_tx(config, input_file=None):
     extra = (payload_size - len(data) % payload_size) % payload_size
     if extra:
         data = data + b"\x00" * extra
-        logger.info("Padded %d → %d bytes (%d frames, %d extra zero bytes)",
+        logger.info("Padded %d -> %d bytes (%d frames, %d extra zero bytes)",
                     len(data) - extra, len(data),
                     len(data) // payload_size, extra)
 
-    # Assemble all frames
-    frames_data = b""
+    # Assemble all frames, modulate each with its own preamble
+    audio_parts = []
     for i in range(0, len(data), payload_size):
         payload = data[i:i + payload_size]
-        frames_data += assembler.assemble_frame(payload)
+        frame = assembler.assemble_frame(payload)
+        audio_parts.append(modulator.modulate_with_preamble(frame))
 
-    # Modulate as single burst
-    audio = modulator.modulate_with_preamble(frames_data)
+    audio = np.concatenate(audio_parts)
     total_dur = len(audio) / config.audio.sample_rate
 
     logger.info("TX: %d frames, %d B payload, %.1f s audio",
                 assembler.sequence_number, len(data), total_dur)
 
-    # Append silence so the RX can finish processing
+    # Append trailing silence
     audio = np.concatenate([audio,
                             np.zeros(int(config.audio.sample_rate * 0.5),
                                      dtype=np.float32)])
@@ -74,7 +74,6 @@ def demo_tx(config, input_file=None):
 
     stream = AudioStream(config.audio, callback_tx=tx_cb)
     stream.start("tx")
-    total_dur = len(audio) / config.audio.sample_rate
     time.sleep(total_dur + 1.0)
     stream.stop()
 
