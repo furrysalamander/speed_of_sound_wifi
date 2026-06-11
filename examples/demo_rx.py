@@ -22,7 +22,18 @@ logging.basicConfig(level=logging.WARNING,
 logger = logging.getLogger("demo_rx")
 
 LISTEN_TIMEOUT = 600
-FRAME_DATA_SYMS = 60
+
+
+def frame_data_syms(config):
+    """Compute the number of data OFDM symbols per frame from config."""
+    nsym = config.fec.nsym
+    data_len = 255 - nsym  # info bytes per RS block
+    data_for_fec = 4 + config.frame.payload_size
+    n_blocks = (data_for_fec + data_len - 1) // data_len
+    frame_bytes = 8 + n_blocks * 255 + 4  # sync + RS blocks + CRC
+    sc = config.ofdm.subcarrier_max - config.ofdm.subcarrier_min + 1
+    bits_per_sym = config.ofdm.bits_per_subcarrier * sc
+    return (frame_bytes * 8 + bits_per_sym - 1) // bits_per_sym
 
 
 def demo_rx(config, output_file=None):
@@ -30,7 +41,8 @@ def demo_rx(config, output_file=None):
     parser = FrameParser(config)
     sym_len = demod.sym_samples
     plen = demod.preamble_symbols * sym_len
-    frame_samples = plen + FRAME_DATA_SYMS * sym_len
+    data_syms = frame_data_syms(config)
+    frame_samples = plen + data_syms * sym_len
     preamble_thresh = 0.10
 
     buf = np.array([], dtype=np.float32)

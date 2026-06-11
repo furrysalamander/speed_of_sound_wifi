@@ -36,9 +36,9 @@ class OfdmConfig:
 
     fft_size: int = 256
     cp_length: int = 32  # shorter CP for higher throughput (167 Hz sym rate vs 125)
-    subcarrier_min: int = 9  # first active subcarrier (1687 Hz, past 1500 Hz dip)
-    subcarrier_max: int = 43  # last active subcarrier (8062 Hz, before rolloff)
-    bits_per_subcarrier: int = 2  # BPSK=1, QPSK=2
+    subcarrier_min: int = 10  # first active subcarrier (1875 Hz, past USB mic dip)
+    subcarrier_max: int = 69  # last active subcarrier (12937 Hz, -3dB rolloff)
+    bits_per_subcarrier: int = 2  # QPSK (2 bits/subcarrier)
     pilot_subcarriers: tuple = ()  # no pilots; DD tracking sufficient with scrambler
     preamble_symbols: int = 4  # number of OFDM symbols in preamble (more = better channel estimate)
 
@@ -56,7 +56,7 @@ class FecConfig:
 class FrameConfig:
     """Frame protocol configuration."""
 
-    payload_size: int = 442  # bytes per frame payload (2 RS blocks: 446/223 = exact fit)
+    payload_size: int = 442  # bytes per frame payload (2 RS(255,223) blocks)
     sync_pattern: bytes = field(
         default_factory=lambda: b"\xAA\x55\xAA\x55\xAA\x55\xAA\x55"
     )

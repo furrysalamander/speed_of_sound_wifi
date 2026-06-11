@@ -13,8 +13,11 @@ import numpy as np
 
 PYTHON = str(Path(sys.executable).parent / "python") if "venv" in sys.executable else sys.executable
 
-# Generate random test data (8 frames = 4 bursts of 2 frames = 1784 bytes)
-data = np.random.default_rng(seed=123).integers(0, 256, size=1784, dtype=np.uint8).tobytes()
+from src.config import Config
+_c = Config()
+# Generate 8 frames of payload data
+data = np.random.default_rng(seed=123).integers(0, 256, size=8 * _c.frame.payload_size, dtype=np.uint8).tobytes()
+del _c
 with open("/tmp/stream_pipe_test_in.bin", "wb") as f:
     f.write(data)
 print(f"Test data: {len(data)} bytes, first 8: {data[:8].hex()}")

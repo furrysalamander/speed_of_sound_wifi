@@ -10,7 +10,7 @@ import time
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input", default="/tmp/shrek_10f.bin",
+    parser.add_argument("--input", default="/tmp/shrek_test_30s.bin",
                         help="Input payload file (default: 10-frame Shrek clip)")
     parser.add_argument("--tx-device", default="analog-stereo",
                         help="Output (TX) device name")

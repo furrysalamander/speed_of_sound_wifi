@@ -2,8 +2,8 @@
 
 Uses Hermitian-symmetric OFDM (DMT) for real-valued audio output.
 Configurable FFT size, CP length, subcarrier range, and bits per subcarrier.
-Supports BPSK (1 bit/sc) and QPSK (2 bits/sc) with pilot subcarriers
-for continuous phase tracking.
+Supports QPSK (2 bits/subcarrier) with optional pilot subcarriers.
+Data bits are XOR-scrambled with a PRNG (seed=12345) before modulation.
 """
 
 import logging
