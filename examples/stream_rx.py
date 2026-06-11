@@ -15,7 +15,7 @@ from src.config import Config
 from src.link.framing import FrameParser
 from src.physical.ofdm import OfdmDemodulator
 
-logging.basicConfig(level=logging.DEBUG,
+logging.basicConfig(level=logging.WARNING,
                     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
                     datefmt="%H:%M:%S")
 logger = logging.getLogger("stream_rx")

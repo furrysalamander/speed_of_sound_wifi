@@ -249,4 +249,77 @@ python -m src.main --loopback --input-name USB_PnP --output-name analog-stereo \
 
 # List audio devices
 python -m src.main --list-devices
+
+# Single-burst streaming test (OTA, USB mic)
+python examples/test_streaming.py --input /tmp/test.bin \
+  --input-name USB_PnP --output-name analog-stereo \
+  --frames-per-burst 10
+
+# Multi-burst pipe test (subprocess, OTA)
+python examples/test_stream_pipe.py
 ```
+
+## Streaming Architecture (June 2026)
+
+### Current OFDM Config
+- **Mode**: QPSK (2 bits/SC), no pilots, 35 SC (9–43), CP=32, FFT=256
+- **Preamble**: 4 OFDM symbols, QPSK, seeded with PRNG(42)
+- **Data rate**: 70 bits/symbol → ~544 B/s (4.35 kbps) effective after RS(255,223) + framing
+- **Output amplitude**: 0.08 peak (default) — avoids USB mic AGC clipping in the first burst
+
+### Single-Burst Mode (Working)
+Reads entire input, assembles all frames, modulates as **one** OFDM burst with a single preamble, plays continuously. Tested up to 10 frames (2230 B, 4.1s audio) with 100% reliability via OTA path.
+
+**Limitations**:
+- PLL tracking degrades over very long bursts (>600 data symbols). Phase drift accumulates beyond the RS(32) correction capability.
+- 20 frames (4460 B, 7.7s) showed uncorrectable RS errors — only 14/20 frames valid.
+
+### Multi-Burst Zero-Gap Mode (Blocked)
+Streaming scripts (`stream_tx_continuous.py`, `stream_rx.py`) support zero-gap concatenation with safety-margin consumption. Works in software but **fails OTA** due to USB mic AGC:
+
+**The AGC Problem**:
+- USB PnP mic (0c76) has hardware AGC with fast attack (~tens of ms)
+- During the first burst (0.744s), AGC reduces gain by 8–10x
+- Subsequent bursts have H ≈ 0.003–0.006 (vs H ≈ 0.02–0.06 for burst 1)
+- Below the `process_samples` channel threshold (0.01), the signal passes
+- But SNR is too low for reliable QPSK demodulation + RS(32) correction
+- Zero gaps between bursts don't help (AGC adapts during the burst, not during gaps)
+- Higher TX amplitude (0.15–0.50) does not help (AGC normalizes output)
+- Lower amplitude (0.02–0.04) does not avoid AGC triggering
+
+**Failed mitigation attempts**:
+| Attempt | Result |
+|---------|--------|
+| Zero gaps between bursts | AGC still adapts during the burst (not gaps) |
+| Higher TX amplitude (0.15–0.50) | AGC normalizes; second burst still 8–10× weaker |
+| Lower TX amplitude (0.02–0.04) | AGC still triggers; signal too weak for demod |
+| CFO clamp ±0.05 | Helps PLL stability but not SNR |
+| Safety margin in consumption | Fixes off-by-one boundary issue but not AGC |
+| Continuous TX (no stop/start) | AGC is device-level, unaffected by software |
+
+**Root cause**: USB mic AGC attack time (~50–200 ms) is much shorter than burst duration (744 ms). The AGC fully adapts within the first burst, leaving subsequent bursts at reduced gain.
+
+### Workarounds
+| Approach | Status | Notes |
+|----------|--------|-------|
+| Motherboard line-in (fixed gain) | Untested | Requires loopback cable, not OTA; no AGC |
+| Single giant burst | Works (≤10 frames) | PLL limits duration; impractical for large files |
+| Continuous pilot tone during gaps | Untested | Might keep AGC locked at consistent level |
+| Pre-emphasis (ramp TX amplitude) | Untested | Counteract AGC by varying per-burst amplitude |
+
+### Next Steps
+1. 🔲 **Test motherboard line-in** with loopback cable — confirm AGC is the root cause
+2. 🔲 **Continuous pilot tone** — send unmodulated carrier at subcarrier frequency during gaps
+3. 🔲 **Pre-emphasis** — start first burst at very low amplitude, ramp up for subsequent bursts
+4. 🔲 **Throughput optimization** — CP=16 (150 Hz sym rate), more subcarriers, reduced pilot overhead
+5. 🔲 **ffplay pipeline** — `stream_rx | ffplay -i pipe:0` for live video demo
+6. 🔲 **Short demo clip** — send a small WebM segment (~50 KB) via single burst or pre-emphasis multi-burst
+
+### Relevant Files
+- `src/physical/ofdm.py` — OFDM modem. Channel threshold 0.01, CFO clamp ±0.05 (was ±0.5), PLL β=0.08, leak=0.999, slope clip ±0.02
+- `src/config.py` — `ModulationConfig.output_amplitude=0.08`, `OfdmConfig`: CP=32, SC=9–43, no pilots, QPSK, FFT=256, preamble=4
+- `examples/stream_tx_continuous.py` — Zero-gap TX (appends no silence between bursts)
+- `examples/stream_rx.py` — Streaming RX with safety-margin consumption (margin=4)
+- `examples/test_stream_pipe.py` — Subprocess-based pipeline test (446 B single-burst passes, 1784 B multi-burst fails)
+- `examples/test_streaming.py` — In-process single-burst test (works up to 10 frames)
+- `examples/stream_tx.py` — Original streaming TX (per-burst AudioStream — deprecated by continuous version)```
