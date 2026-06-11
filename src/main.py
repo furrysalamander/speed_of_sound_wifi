@@ -61,6 +61,9 @@ def parse_args():
         help="Number of FSK tones"
     )
     mod_group.add_argument(
+        "--ofdm", action="store_true", help="Use OFDM modulation instead of FSK"
+    )
+    mod_group.add_argument(
         "--freq-min", type=int, default=None, help="Minimum frequency (Hz)"
     )
     mod_group.add_argument(
@@ -113,6 +116,8 @@ def create_config(args) -> Config:
         config.modulation.baud_rate = args.baud_rate
     if args.m_fsk:
         config.modulation.m_fsk = args.m_fsk
+    if args.ofdm:
+        config.modulation.use_ofdm = True
     if args.freq_min:
         config.modulation.freq_min = args.freq_min
     if args.freq_max:

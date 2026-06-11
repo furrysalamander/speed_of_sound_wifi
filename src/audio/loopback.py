@@ -15,6 +15,7 @@ from src.config import Config
 from src.audio.io import AudioStream
 from src.physical.modulator import FskModulator
 from src.physical.demodulator import FskDemodulator
+from src.physical.ofdm import OfdmModulator, OfdmDemodulator
 from src.link.framing import FrameAssembler, FrameParser
 
 logger = logging.getLogger(__name__)
@@ -72,8 +73,12 @@ class LoopbackTester:
 
     def __init__(self, config: Config):
         self.config = config
-        self.modulator = FskModulator(config)
-        self.demodulator = FskDemodulator(config)
+        if config.modulation.use_ofdm:
+            self.modulator = OfdmModulator(config)
+            self.demodulator = OfdmDemodulator(config)
+        else:
+            self.modulator = FskModulator(config)
+            self.demodulator = FskDemodulator(config)
         self.assembler = FrameAssembler(config)
         self.parser = FrameParser(config)
         self.stream: Optional[AudioStream] = None
@@ -193,33 +198,51 @@ class LoopbackTester:
         else:
             logger.info("  No silence cropping (RX buffer too short)")
 
-        demod = FskDemodulator(self.config)
-        symbols = demod.process_samples(all_rx)
-        if symbols is None or len(symbols) == 0:
-            logger.warning("  No symbols detected after cropping")
-            result.error_message = "No symbols detected"
-            return result
-        result.sync_acquired = True
-        logger.info("  Symbols: %d total", len(symbols))
-        logger.info("  First 20 symbols: %s", symbols[:20].tolist())
+        # Use appropriate demodulator for mode
+        if self.config.modulation.use_ofdm:
+            bits = self.demodulator.process_samples(all_rx)
+            if bits is None or len(bits) == 0:
+                logger.warning("  No bits detected after cropping")
+                result.error_message = "No bits detected"
+                return result
+            result.sync_acquired = True
+            logger.info("  Bits: %d total", len(bits))
+            # Compute byte estimate (frame bytes + margin)
+            frame_size_est = 8 + 4 + len(payload) + self.config.fec.nsym + 4
+            if not self.config.fec.enabled:
+                frame_size_est = 8 + 4 + len(payload) + 4
+            rs_block_data = 255 - self.config.fec.nsym
+            if self.config.fec.enabled:
+                data_for_fec = 4 + len(payload)
+                num_blocks = math.ceil(data_for_fec / rs_block_data)
+                fec_size = num_blocks * 255
+                frame_size_est = 8 + fec_size + 4
+            byte_est = frame_size_est + 64
+            decoded_bytes = self.demodulator.symbols_to_bytes(bits, byte_est)
+        else:
+            demod = FskDemodulator(self.config)
+            symbols = demod.process_samples(all_rx)
+            if symbols is None or len(symbols) == 0:
+                logger.warning("  No symbols detected after cropping")
+                result.error_message = "No symbols detected"
+                return result
+            result.sync_acquired = True
+            logger.info("  Symbols: %d total", len(symbols))
+            logger.info("  First 20 symbols: %s", symbols[:20].tolist())
+            frame_size_est = 8 + 4 + len(payload) + self.config.fec.nsym + 4
+            if not self.config.fec.enabled:
+                frame_size_est = 8 + 4 + len(payload) + 4
+            rs_block_data = 255 - self.config.fec.nsym
+            if self.config.fec.enabled:
+                data_for_fec = 4 + len(payload)
+                num_blocks = math.ceil(data_for_fec / rs_block_data)
+                fec_size = num_blocks * 255
+                frame_size_est = 8 + fec_size + 4
+            byte_est = frame_size_est + 64
+            decoded_bytes = self.demodulator.symbols_to_bytes(symbols, byte_est)
 
-        # Compute generous byte estimate: frame bytes + preamble margin
-        frame_size_est = 8 + 4 + len(payload) + self.config.fec.nsym + 4
-        if not self.config.fec.enabled:
-            frame_size_est = 8 + 4 + len(payload) + 4
-        # FEC encoder pads to full RS blocks of 255 bytes
-        rs_block_data = 255 - self.config.fec.nsym
-        if self.config.fec.enabled:
-            data_for_fec = 4 + len(payload)
-            num_blocks = math.ceil(data_for_fec / rs_block_data)
-            fec_size = num_blocks * 255
-            frame_size_est = 8 + fec_size + 4
-        byte_est = frame_size_est + 64  # +64 for preamble margin
-
-        decoded_bytes = self.demodulator.symbols_to_bytes(symbols, byte_est)
         logger.info("  Decoded %d bytes", len(decoded_bytes))
         logger.info("  First 24 decoded bytes hex: %s", decoded_bytes[:24].hex())
-        logger.info("  Symbols 60-80: %s", symbols[60:81].tolist() if len(symbols) >= 81 else symbols[60:].tolist())
 
         # Feed to frame parser
         frames = self.parser.feed_bytes(decoded_bytes)

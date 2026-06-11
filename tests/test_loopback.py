@@ -64,6 +64,8 @@ def parse_args():
                            help="Baud rate (default: 1000)")
     mod_group.add_argument("--m-fsk", type=int, choices=[2, 4, 8, 16], default=4,
                            help="M-FSK order (default: 4)")
+    mod_group.add_argument("--ofdm", action="store_true",
+                           help="Use OFDM modulation instead of FSK")
     mod_group.add_argument("--freq-min", type=int, default=200,
                            help="Min frequency Hz (default: 200)")
     mod_group.add_argument("--freq-max", type=int, default=18000,
@@ -109,6 +111,7 @@ def build_configs(args) -> list:
             config = Config()
             config.modulation.baud_rate = baud
             config.modulation.m_fsk = mfsk
+            config.modulation.use_ofdm = args.ofdm
             config.modulation.freq_min = args.freq_min
             config.modulation.freq_max = args.freq_max
             config.fec.enabled = not args.no_fec

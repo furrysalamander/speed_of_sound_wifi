@@ -2,7 +2,9 @@
 
 ## Hardware Setup
 
-Connect a 3.5mm TRS male-to-male audio cable between the computer's **output** (speaker/headphone) and **input** (microphone/line-in) jacks.
+Connect a 3.5mm TRS male-to-male audio cable between the computer's **output** (speaker/headphone) and **input** (microphone/line-in) jacks. Two variants:
+- **Motherboard line-in** (flat response, up to 2000 baud reliable)
+- **USB PnP Audio Device** (0c76 vendor, index 19, dip at 1200-1500 Hz, otherwise flat 200-8000+ Hz)
 
 ### Find Device Indices
 
@@ -46,14 +48,13 @@ python -m src.main --loopback --input-device 23 --output-device 18 \
   --payload-size 1024 --baud-rate 1000 --m-fsk 4
 ```
 
-### Loopback Combined Sweep
+### OFDM Mode
 
 ```bash
-python -m src.main --loopback --input-device 23 --output-device 18 \
-  --payload-size 1024 --sweep-baud 500 1000 2000 3000 --output-csv sweep.csv
+python tests/test_loopback.py -i 19 -o 17 --ofdm --payload-size 4096
 ```
 
-## Loopback Test Results (Microphone/Line-In Cable)
+## Loopback Test Results (Motherboard Line-In)
 
 ### Baud Rate Sweep (4-FSK, FEC on, 1024B payload)
 
@@ -63,58 +64,88 @@ python -m src.main --loopback --input-device 23 --output-device 18 \
 | 1000 | 4     | on   | yes   | 1     | 1024   | 1059 bps   |
 | 2000 | 4     | on   | yes   | 1     | 1024   | 1598 bps   |
 | 2200 | 4     | on   | yes   | 0     | 0      | 0 bps      |
-| 3000 | 4     | on   | yes   | 0     | 0      | 0 bps      |
-| 5000 | 4     | on   | yes   | 0     | 0      | 0 bps      |
-| 7500 | 4     | on   | yes   | 0     | 0      | 0 bps      |
-| 10000| 4     | on   | yes   | 0     | 0      | 0 bps      |
-
-**Max reliable baud rate: 2000 baud** (24 samples/symbol at 48kHz).  
-Failure at ≥2200 baud due to insufficient FFT resolution — the hann-windowed FFT at <22 samples/symbol can't reliably distinguish the 4 tones (4450 Hz spacing) against FFT bins of ≥2182 Hz width.
 
 ### M-FSK Sweep (1000 baud, FEC on, 1024B payload)
 
-| M-FSK | Sync? | Valid | Recv'd | Throughput | Bits/sym |
-|-------|-------|-------|--------|------------|----------|
-| 2     | yes   | 1     | 1024   | 636 bps    | 1        |
-| 4     | yes   | 1     | 1024   | 1059 bps   | 2        |
-| 8     | yes   | 1     | 1024   | 1361 bps   | 3        |
-| 16    | yes   | 0     | 0      | 0 bps      | 4        |
+| M-FSK | Sync? | Valid | Recv'd | Throughput |
+|-------|-------|-------|--------|------------|
+| 2     | yes   | 1     | 1024   | 636 bps    |
+| 4     | yes   | 1     | 1024   | 1059 bps   |
+| 8     | yes   | 1     | 1024   | 1361 bps   |
+| 16    | yes   | 0     | 0      | 0 bps      |
 
-- 8-FSK is the best at 1000 baud (1361 bps throughput, 3 bits/symbol).
-- 16-FSK fails because 16 tones across 200-18000 Hz gives ~1133 Hz spacing per tone, which is unresolvable at 48-sample symbols (1000 Hz FFT bins).
+## Loopback Test Results (USB PnP Audio Device)
 
-### FEC Dependency
+### Optimal 4-FSK Config
 
-- **2000 baud, FEC on**: PASS (1024 bytes received)
-- **2000 baud, FEC off**: FAIL (CRC verification fails due to bit errors)
+| Baud | M-FSK | Payload | Pass Rate | Throughput |
+|------|-------|---------|-----------|------------|
+| 500  | 4     | 128 B   | ~100%     | 214 bps    |
+| 750  | 4     | 128 B   | ~67%      | 254 bps    |
+| 750  | 4     | 256 B   | ~33%      | 380 bps    |
 
-FEC (RS-32) is essential for reliable transmission even at low baud rates.
+### Success Parameters (2-FSK, 500 baud, 1500-5500 Hz)
 
-## Known Limitation: FFT Resolution at High Baud Rates
+This config works reliably (64-byte payload, 74 bps):
+- **Goertzel detection** (DTFT at exact tone frequencies) instead of FFT bins
+- **Purity-based symbol alignment**: brute-force search maximizes `e0/e1_cross * e1/e0_cross`
+- **FEC-before-CRC**: Reed-Solomon correction applied before CRC verification
+- **Sync threshold**: 4/8 byte matches (soft sync)
+- **ADC notch**: DC offset removal before Goertzel
+- **Frequencies**: 3000-9000 Hz range (avoiding 1200-1500 Hz USB mic dip)
 
-The demodulator uses windowed FFT for tone detection. The FFT resolution is:
+### USB Mic Frequency Response (Normalized)
 
 ```
-bin_width = sample_rate / symbol_samples = sample_rate / (sample_rate / baud_rate) = baud_rate
+200-1200 Hz:  flat (±10%)
+1200-1500 Hz: dip to ~50%  ← AVOID
+1500-8000 Hz: flat (±10%)
+8000+ Hz:    rolls off (present but weaker)
 ```
 
-At 3000 baud → 3000 Hz/bin → only 9 real FFT bins. With the default 200-18000 Hz range and 4-FSK (4450 Hz/tone), tones fall between FFT bins and the hann window's main lobe smears adjacent bins enough to cause symbol errors.
+### Key Improvements Made
 
-### Potential Improvements for Higher Baud Rates
+1. **Goertzel energy detection** (`_goertzel_detect` in `demodulator.py`): Computes energy at exact tone frequencies via Hann-windowed DTFT. Much better selectivity than FFT-bin-based methods for short symbol lengths.
 
-1. **OFDM** (as you mentioned): Splits the channel into many orthogonal subcarriers, each with a long symbol duration. This lets the system use many narrowband subcarriers simultaneously, achieving high aggregate throughput while maintaining robust per-subcarrier detection.
+2. **Purity-based alignment refinement**: After coarse preamble detection, brute-force searches ±1 symbol for the offset maximizing `(e_tone0 / e_toneM1) * (e_toneM1 / e_tone0)` for adjacent symbols.
 
-2. **Goertzel algorithm**: Instead of a full FFT, the demodulator could evaluate signal energy at only the expected tone frequencies. This works well for M-FSK with few tones and short symbol lengths.
+3. **FEC-before-CRC** (`framing.py`): Applies RS decoding before CRC verification. Previously CRC was verified on raw data, rejecting frames before FEC could correct errors.
 
-3. **Phase-locked loop (PLL) demodulation**: Tracks the instantaneous frequency of the carrier by measuring phase changes between samples. Works with as few as ~2-4 samples per bit and is used by legacy FSK modems (Bell 202, V.23) at 1200-2400 baud over audio channels.
+4. **Soft sync** with lowered threshold (4/8 bytes): Tolerates bit errors in sync pattern.
 
-4. **Matched filter / correlator**: Each tone has a known time-domain waveform; the receiver correlates the incoming signal against each candidate tone and picks the best match.
+## OFDM Implementation
 
-## All Tests Pass
+### Parameters (current defaults)
 
-```bash
-python -m pytest tests/ -v  # 32 tests, all pass
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| FFT size | 256 | 187.5 Hz subcarrier spacing |
+| CP length | 64 samples | ~1.3 ms guard interval |
+| Active subcarriers | 4-64 (61 total) | 750-12000 Hz band |
+| Subcarrier modulation | QPSK (2 bits) | Gray-coded |
+| Preamble | 2 OFDM symbols | Known QPSK for channel estimation |
+| Symbol duration | 320 samples (6.67 ms) | CP + FFT body |
+| Symbol rate | 150 Hz | 48000/320 |
+
+### Throughput Estimate
+
 ```
+Raw:         61 subcarriers × 2 bits × 150 Hz = 18,300 bps
+RS-FEC (32): 18,300 × (223/255)              = 16,012 bps
+Framing:     16,012 × (223/271)              ≈ 12,570 bps
+```
+
+Target 7.5 kbps is feasible with >50% margin.
+
+### Timing Recovery
+
+Uses **preamble cross-correlation** (not CP autocorrelation):
+- Demodulator stores the full time-domain preamble (generated identically to modulator)
+- Cross-correlates with incoming samples to find preamble start
+- Provides accurate timing even with the raised-cosine onset ramp on the first CP
+
+Channel estimation uses zero-forcing from the 2 known preamble symbols.
+One-tap equalization per subcarrier for data symbols.
 
 ## Commands Summary
 
@@ -125,16 +156,28 @@ python -m pytest tests/ -v
 # Software-only round-trip
 python -m src.main --headless
 
-# Hardware loopback with defaults
-python tests/test_loopback.py -i <INPUT_IDX> -o <OUTPUT_IDX>
+# Hardware loopback (USB mic, FSK)
+python tests/test_loopback.py -i 19 -o 17 --payload-size 64 --baud-rate 500 \
+  --freq-min 3000 --freq-max 7000 --m-fsk 2
+
+# Hardware loopback (USB mic, 4-FSK)
+python tests/test_loopback.py -i 19 -o 17 --payload-size 128 --baud-rate 500 \
+  --freq-min 3000 --freq-max 9000 --m-fsk 4
+
+# Hardware loopback (USB mic, OFDM)
+python tests/test_loopback.py -i 19 -o 17 --ofdm --payload-size 4096
 
 # Hardware loopback with parameter sweep
-python tests/test_loopback.py -i <INPUT_IDX> -o <OUTPUT_IDX> \
-  --sweep-baud 500 1000 2000 --sweep-mfsk 2 4 8 --output-csv results.csv
+python tests/test_loopback.py -i 19 -o 17 --payload-size 128 \
+  --sweep-baud 500 750 --sweep-mfsk 2 4 --output-csv results.csv
 
-# CLI loopback mode
-python -m src.main --loopback --input-device <IDX> --output-device <IDX> \
-  --baud-rate 2000 --m-fsk 8 --payload-size 1024 --output-csv results.csv
+# CLI loopback mode (FSK)
+python -m src.main --loopback --input-device 19 --output-device 17 \
+  --payload-size 1024 --baud-rate 2000 --m-fsk 8 --output-csv results.csv
+
+# CLI loopback mode (OFDM)
+python -m src.main --loopback --input-device 19 --output-device 17 \
+  --ofdm --payload-size 4096 --output-csv results.csv
 
 # List audio devices
 python -m src.main --list-devices
