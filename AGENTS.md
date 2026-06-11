@@ -257,6 +257,15 @@ python examples/test_streaming.py --input /tmp/test.bin \
 
 # Multi-burst pipe test (subprocess, OTA)
 python examples/test_stream_pipe.py
+
+# OTA demo pipeline (RX -> ffplay)
+python -m examples.demo_pipeline --input /tmp/shrek_10f.bin
+
+# Single-burst TX only
+python -m examples.demo_tx --input /tmp/test.bin --input-name analog-stereo
+
+# Single-burst RX only (pipe to ffplay)
+python -m examples.demo_rx --output-name USB_PnP | ffplay -i pipe:0 -an -nodisp
 ```
 
 ## Streaming Architecture (June 2026)
@@ -268,7 +277,12 @@ python examples/test_stream_pipe.py
 - **Output amplitude**: 0.08 peak (default) — avoids USB mic AGC clipping in the first burst
 
 ### Single-Burst Mode (Working)
-Reads entire input, assembles all frames, modulates as **one** OFDM burst with a single preamble, plays continuously. Tested up to 10 frames (2230 B, 4.1s audio) with 100% reliability via OTA path.
+Reads entire input, assembles all frames, modulates as **one** OFDM burst with a single preamble, plays continuously. Tested up to 10 frames (2230 B, 4.1s audio, 600 data syms) with 100% reliability via OTA path.
+
+**Reliability Boundary**:
+- **10 frames (600 data syms, 2230 B)**: reliable (3/3 runs verified)
+- **11 frames (660 data syms, 2453 B)**: degrades (only ~10 frames valid)
+- **14+ frames (840+ data syms)**: unreliable — PLL phase drift exceeds RS(32) correction
 
 **Limitations**:
 - PLL tracking degrades over very long bursts (>600 data symbols). Phase drift accumulates beyond the RS(32) correction capability.
@@ -299,25 +313,49 @@ Streaming scripts (`stream_tx_continuous.py`, `stream_rx.py`) support zero-gap c
 
 **Root cause**: USB mic AGC attack time (~50–200 ms) is much shorter than burst duration (744 ms). The AGC fully adapts within the first burst, leaving subsequent bursts at reduced gain.
 
-### Workarounds
-| Approach | Status | Notes |
-|----------|--------|-------|
-| Motherboard line-in (fixed gain) | Untested | Requires loopback cable, not OTA; no AGC |
-| Single giant burst | Works (≤10 frames) | PLL limits duration; impractical for large files |
-| Continuous pilot tone during gaps | Untested | Might keep AGC locked at consistent level |
-| Pre-emphasis (ramp TX amplitude) | Untested | Counteract AGC by varying per-burst amplitude |
+### OTA Demo Pipeline (Working)
+Single-burst pipeline that reads a payload file, plays as OFDM audio over speaker, captures on USB mic, and pipes decoded bytes to ffplay.
+
+```bash
+# Convenience launcher (wraps TX + RX + ffplay)
+python -m examples.demo_pipeline --input /tmp/shrek_10f.bin
+
+# Or run components manually:
+# Terminal 1 (RX -> ffplay):
+python -m examples.demo_rx --output-name USB_PnP | ffplay -i pipe:0 -an -nodisp
+# Terminal 2 (TX):
+python -m examples.demo_tx --input /tmp/shrek_10f.bin --input-name analog-stereo
+
+# To file (no ffplay):
+python -m examples.demo_pipeline --input /tmp/shrek_10f.bin --no-ffplay --output /tmp/out.bin
+```
+
+### Prepare Demo Clip
+```bash
+# Extract a 2-second WebM segment from the Shrek file:
+ffmpeg -ss 0 -t 2 -i absolute_smallest_shrek_v2_stripped.webm -c copy /tmp/shrek_2s.webm
+
+# Pad to 10-frame boundary (2230 B = 10 × 223 B):
+python -c "
+data = open('/tmp/shrek_2s.webm', 'rb').read()[:2230]
+data += b'\\x00' * (2230 - len(data))
+open('/tmp/shrek_10f.bin', 'wb').write(data)
+"
+```
 
 ### Next Steps
-1. 🔲 **Test motherboard line-in** with loopback cable — confirm AGC is the root cause
-2. 🔲 **Continuous pilot tone** — send unmodulated carrier at subcarrier frequency during gaps
-3. 🔲 **Pre-emphasis** — start first burst at very low amplitude, ramp up for subsequent bursts
-4. 🔲 **Throughput optimization** — CP=16 (150 Hz sym rate), more subcarriers, reduced pilot overhead
-5. 🔲 **ffplay pipeline** — `stream_rx | ffplay -i pipe:0` for live video demo
-6. 🔲 **Short demo clip** — send a small WebM segment (~50 KB) via single burst or pre-emphasis multi-burst
+1. ✅ **ffplay pipeline** — `demo_rx | ffplay -i pipe:0` for live video demo
+2. ✅ **Short demo clip** — 2s WebM clip (2333 B, 10 frames = 2230 B within reliable limit)
+3. 🔲 **Continuous pilot tone** — send unmodulated carrier during gaps to lock AGC
+4. 🔲 **Pre-emphasis** — start first burst at low amplitude, ramp up for subsequent bursts
+5. 🔲 **Thoughput optimization** — CP=16 (150 Hz sym rate), more subcarriers, reduced pilot overhead
 
 ### Relevant Files
 - `src/physical/ofdm.py` — OFDM modem. Channel threshold 0.01, CFO clamp ±0.05 (was ±0.5), PLL β=0.08, leak=0.999, slope clip ±0.02
 - `src/config.py` — `ModulationConfig.output_amplitude=0.08`, `OfdmConfig`: CP=32, SC=9–43, no pilots, QPSK, FFT=256, preamble=4
+- `examples/demo_tx.py` — Single-burst TX: reads file, frames, modulates, plays, exits
+- `examples/demo_rx.py` — Single-burst RX: listens for preamble, demodulates all symbols, parses frames, writes payload to stdout
+- `examples/demo_pipeline.py` — Convenience launcher: starts RX + optional ffplay, runs TX, waits, cleans up
 - `examples/stream_tx_continuous.py` — Zero-gap TX (appends no silence between bursts)
 - `examples/stream_rx.py` — Streaming RX with safety-margin consumption (margin=4)
 - `examples/test_stream_pipe.py` — Subprocess-based pipeline test (446 B single-burst passes, 1784 B multi-burst fails)
