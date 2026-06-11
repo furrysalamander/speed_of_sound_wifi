@@ -189,26 +189,24 @@ class LoopbackTester:
         logger.info("  RX samples: %d (%.2f s)",
                      len(all_rx), len(all_rx) / self.config.audio.sample_rate)
 
-        # Crop leading silence so the demodulator's preamble search works
-        # with a reasonable search range.
-        symbol_samples = self.config.symbol_duration_samples
-        window_size = max(1, symbol_samples // 4)
-        num_windows = len(all_rx) // window_size
-        if num_windows > 0:
-            rx_trim = all_rx[:num_windows * window_size]
-            windows = rx_trim.reshape(-1, window_size)
-            energies = np.sqrt(np.mean(windows ** 2, axis=1))
-            energy_threshold = max(np.max(energies) * 0.05, 0.001)
-            above = energies > energy_threshold
-            above_streak = np.convolve(above.astype(np.int32), np.ones(5, dtype=np.int32), mode='same') >= 5
-            signal_start_idx = np.argmax(above_streak) if np.any(above_streak) else 0
-            signal_start = signal_start_idx * window_size
-            if signal_start > 0:
-                all_rx = all_rx[signal_start:]
-                logger.info("  Cropped %d samples (%.0f ms) of leading silence",
-                            signal_start, signal_start / self.config.audio.sample_rate * 1000)
+        # Crop trailing to expected burst length (no leading crop — demod's internal
+        # cross-correlation handles preamble finding more reliably than window-based cropping).
+        if self.config.modulation.use_ofdm:
+            sym_samples = self.config.ofdm_symbol_samples
+            preamble_samples = self.config.ofdm.preamble_symbols * sym_samples
+            frame_bits = len(frame) * 8
+            data_bits_per_sym = self.config.ofdm_bits_per_symbol
+            data_syms = max(1, int(np.ceil(frame_bits / data_bits_per_sym)))
+            expected_burst = preamble_samples + data_syms * sym_samples
+            expected = expected_burst + int(self.config.audio.sample_rate * 0.2)
         else:
-            logger.info("  No silence cropping (RX buffer too short)")
+            expected = total_tx_samples + int(self.config.audio.sample_rate * 0.15)
+
+        if len(all_rx) > expected:
+            cropped = len(all_rx) - expected
+            all_rx = all_rx[:expected]
+            logger.info("  Cropped %d samples (%.0f ms) of trailing silence",
+                        cropped, cropped / self.config.audio.sample_rate * 1000)
 
         # Use actual frame size for byte estimation
         frame_size = len(frame)

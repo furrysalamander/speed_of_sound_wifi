@@ -127,7 +127,7 @@ class FskModulator:
         # Normalize to avoid clipping
         max_val = np.max(np.abs(output))
         if max_val > 0:
-            output = output * (0.9 / max_val)
+            output = output * (self.config.modulation.output_amplitude / max_val)
 
         return output
 

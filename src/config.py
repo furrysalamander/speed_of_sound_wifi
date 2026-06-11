@@ -27,6 +27,7 @@ class ModulationConfig:
     freq_max: int = 18000  # maximum frequency in Hz
     window_type: str = "hann"  # window function for tone generation
     use_ofdm: bool = False  # use OFDM instead of FSK
+    output_amplitude: float = 0.08  # peak output amplitude. USB mic: 0.05-0.10 avoids AGC clipping
 
 
 @dataclass

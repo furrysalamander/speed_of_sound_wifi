@@ -186,7 +186,7 @@ class OfdmModulator:
         # Normalize
         max_val = np.max(np.abs(result))
         if max_val > 0:
-            result = result * (0.9 / max_val)
+            result = result * (self.config.modulation.output_amplitude / max_val)
 
         return result
 
@@ -344,11 +344,12 @@ class OfdmDemodulator:
 
         logger.debug("OFDM: xcorr peak=%f norm=%f", peak_val, norm_peak)
 
-        if norm_peak < 0.15:
-            logger.debug("OFDM: weak correlation (norm=%f < 0.15)", norm_peak)
+        if norm_peak < 0.10:
+            logger.debug("OFDM: weak correlation (norm=%f < 0.10)", norm_peak)
             return None
 
         start_idx = coarse_start + peak_idx
+        self._last_preamble_start = coarse_start + peak_idx
 
         # 3. Extract preamble symbols
         preamble_fd = []
@@ -364,8 +365,8 @@ class OfdmDemodulator:
         self._channel_est = self._estimate_channel(preamble_fd)
         H = self._channel_est
 
-        if np.mean(np.abs(H)) < 0.05:
-            logger.debug("OFDM: channel too weak")
+        if np.mean(np.abs(H)) < 0.01:
+            logger.debug("OFDM: channel too weak (H=%.4f < 0.01)", np.mean(np.abs(H)))
             return None
 
         # 5. Estimate CFO from preamble symbols to initialize DD tracking.
@@ -384,13 +385,15 @@ class OfdmDemodulator:
                            np.cos(preamble_phases[i+1] - preamble_phases[i]))
                 for i in range(self.preamble_symbols - 1)
             ])
-            # Store CFO frequency for second-order phase tracking
-            self._cfo_freq = per_sym_drift
+            # Store CFO frequency for second-order phase tracking.
+            # Clamp to reasonable range — unreliable estimates from weak
+            # signals (< 0.10 H) can produce wild CFO values.
+            self._cfo_freq = np.clip(per_sym_drift, -0.05, 0.05)
             # Channel estimate H includes the CFO phase at the preamble center
             # (~symbol 1.5 for 4 preamble symbols). The first data symbol is
             # at index 4. So the residual phase at first data symbol (after
             # equalization by H) is (4 - 1.5) * per_sym_drift = 2.5 * per_sym_drift.
-            self._dd_common = per_sym_drift * (self.preamble_symbols - 1.5)
+            self._dd_common = self._cfo_freq * (self.preamble_symbols - 1.5)
             self._dd_common = np.arctan2(np.sin(self._dd_common), np.cos(self._dd_common))
             self._dd_slope = 0.0
             logger.debug("OFDM: initial dd_common=%.4f cfo_freq=%.4f rad/sym",
@@ -451,16 +454,17 @@ class OfdmDemodulator:
                 new_common = float(coeffs[0])
                 new_slope = float(coeffs[1])
 
-                # Second-order PLL with frequency integrator
-                beta = 0.03
-                self._cfo_freq += beta * new_common
-                self._cfo_freq = np.clip(self._cfo_freq, -0.5, 0.5)
+                # Second-order PLL with frequency integrator + leak
+                beta = 0.08
+                leak = 0.999
+                self._cfo_freq = leak * self._cfo_freq + beta * new_common
+                self._cfo_freq = np.clip(self._cfo_freq, -0.05, 0.05)
                 self._dd_common += self._cfo_freq + self._dd_alpha * new_common
                 self._dd_common = np.arctan2(np.sin(self._dd_common),
                                              np.cos(self._dd_common))
                 self._dd_slope = np.clip(
                     (1 - self._dd_alpha) * self._dd_slope + self._dd_alpha * new_slope,
-                    -0.05, 0.05
+                    -0.02, 0.02
                 )
             except np.linalg.LinAlgError:
                 pass
