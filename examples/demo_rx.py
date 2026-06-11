@@ -105,7 +105,6 @@ def demo_rx(config, output_file=None):
                                     seq, len(payload), total_received, epoch)
 
             if success:
-                # Use precise preamble position from process_samples to avoid drift
                 plen_start = getattr(demod, '_last_preamble_start', None)
                 if plen_start is not None:
                     data_syms = len(bits) // demod.data_bits_per_sym
@@ -114,10 +113,9 @@ def demo_rx(config, output_file=None):
                 else:
                     search_pos = abs_pos + frame_samples
             else:
-                # Advance just past this position
-                logger.warning("Frame skipped: npk=%.3f at t=%.1fs", npk,
-                               time.time() - t0)
-                search_pos = search_pos + 1
+                logger.warning("Frame skipped at t=%.1fs (npk=%.3f, buf=%d, abs_pos=%d)",
+                               time.time() - t0, npk, len(buf), abs_pos)
+                search_pos = abs_pos + frame_samples  # skip whole frame on failure
 
             # Prune old data to keep buffer bounded
             if search_pos > 2 * frame_samples:
