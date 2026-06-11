@@ -56,7 +56,7 @@ class FecConfig:
 class FrameConfig:
     """Frame protocol configuration."""
 
-    payload_size: int = 223  # bytes per frame payload (matches RS block size)
+    payload_size: int = 442  # bytes per frame payload (2 RS blocks: 446/223 = exact fit)
     sync_pattern: bytes = field(
         default_factory=lambda: b"\xAA\x55\xAA\x55\xAA\x55\xAA\x55"
     )

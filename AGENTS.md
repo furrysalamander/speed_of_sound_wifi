@@ -273,20 +273,20 @@ python -m examples.demo_rx --output-name USB_PnP | ffplay -i pipe:0 -an -nodisp
 ### Current OFDM Config
 - **Mode**: QPSK (2 bits/SC), no pilots, 35 SC (9–43), CP=32, FFT=256
 - **Preamble**: 4 OFDM symbols, QPSK, seeded with PRNG(42)
-- **Data rate**: 70 bits/symbol → ~544 B/s (4.35 kbps) effective after RS(255,223) + framing
+- **Data rate**: 70 bits/symbol → ~1.23 kB/s (9.84 kbps) effective after RS(255,223) + framing (payload_size=442)
 - **Output amplitude**: 0.08 peak (default) — avoids USB mic AGC clipping in the first burst
 
 ### Single-Burst Mode (Working)
-Reads entire input, assembles all frames, modulates as **one** OFDM burst with a single preamble, plays continuously. Tested up to 10 frames (2230 B, 4.1s audio, 600 data syms) with 100% reliability via OTA path.
+Reads entire input, assembles all frames, modulates as **one** OFDM burst with a single preamble, plays continuously. Tested up to 10 frames (4420 B, 3.6s audio, 600 data syms) with 100% reliability via OTA path.
 
 **Reliability Boundary**:
-- **10 frames (600 data syms, 2230 B)**: reliable (3/3 runs verified)
-- **11 frames (660 data syms, 2453 B)**: degrades (only ~10 frames valid)
+- **10 frames (600 data syms, 4420 B)**: reliable (3/3 runs verified)
+- **11 frames (660 data syms, 4862 B)**: marginal (passing RS(32) limit)
 - **14+ frames (840+ data syms)**: unreliable — PLL phase drift exceeds RS(32) correction
 
 **Limitations**:
 - PLL tracking degrades over very long bursts (>600 data symbols). Phase drift accumulates beyond the RS(32) correction capability.
-- 20 frames (4460 B, 7.7s) showed uncorrectable RS errors — only 14/20 frames valid.
+- 20 frames (8840 B, 7.7s, 1200 data syms) showed uncorrectable RS errors — only 14/20 frames valid.
 
 ### Multi-Burst Zero-Gap Mode (Blocked)
 Streaming scripts (`stream_tx_continuous.py`, `stream_rx.py`) support zero-gap concatenation with safety-margin consumption. Works in software but **fails OTA** due to USB mic AGC:
@@ -318,41 +318,46 @@ Single-burst pipeline that reads a payload file, plays as OFDM audio over speake
 
 ```bash
 # Convenience launcher (wraps TX + RX + ffplay)
-python -m examples.demo_pipeline --input /tmp/shrek_10f.bin
+python -m examples.demo_pipeline --input /tmp/shrek_10f_442.bin
 
 # Or run components manually:
 # Terminal 1 (RX -> ffplay):
 python -m examples.demo_rx --output-name USB_PnP | ffplay -i pipe:0 -an -nodisp
 # Terminal 2 (TX):
-python -m examples.demo_tx --input /tmp/shrek_10f.bin --input-name analog-stereo
+python -m examples.demo_tx --input /tmp/shrek_10f_442.bin --input-name analog-stereo
 
 # To file (no ffplay):
-python -m examples.demo_pipeline --input /tmp/shrek_10f.bin --no-ffplay --output /tmp/out.bin
+python -m examples.demo_pipeline --input /tmp/shrek_10f_442.bin --no-ffplay --output /tmp/out.bin
 ```
 
 ### Prepare Demo Clip
 ```bash
-# Extract a 2-second WebM segment from the Shrek file:
-ffmpeg -ss 0 -t 2 -i absolute_smallest_shrek_v2_stripped.webm -c copy /tmp/shrek_2s.webm
+# Extract a 4-second WebM segment from the Shrek file:
+ffmpeg -ss 0 -t 4 -i absolute_smallest_shrek_v2_stripped.webm -c copy /tmp/shrek_4s.webm
 
-# Pad to 10-frame boundary (2230 B = 10 × 223 B):
+# Pad to 442-byte frame boundary (≤10 frames for reliability):
 python -c "
-data = open('/tmp/shrek_2s.webm', 'rb').read()[:2230]
-data += b'\\x00' * (2230 - len(data))
-open('/tmp/shrek_10f.bin', 'wb').write(data)
+data = open('/tmp/shrek_4s.webm', 'rb').read()
+payload_size = 442
+n_frames = min(10, (len(data) + payload_size - 1) // payload_size)
+max_payload = n_frames * payload_size
+data = data[:max_payload]
+data += b'\\x00' * (max_payload - len(data))
+open('/tmp/shrek_10f_442.bin', 'wb').write(data)
 "
 ```
 
 ### Next Steps
 1. ✅ **ffplay pipeline** — `demo_rx | ffplay -i pipe:0` for live video demo
-2. ✅ **Short demo clip** — 2s WebM clip (2333 B, 10 frames = 2230 B within reliable limit)
-3. 🔲 **Continuous pilot tone** — send unmodulated carrier during gaps to lock AGC
-4. 🔲 **Pre-emphasis** — start first burst at low amplitude, ramp up for subsequent bursts
-5. 🔲 **Thoughput optimization** — CP=16 (150 Hz sym rate), more subcarriers, reduced pilot overhead
+2. ✅ **Short demo clip** — 4s WebM clip (3962 B, 9 frames = 3978 B within reliable limit)
+3. ✅ **Throughput optimization** — payload_size=442 (84.7% framing efficiency vs 42.7%), effective 9.84 kbps
+4. 🔲 **Continuous pilot tone** — send unmodulated carrier during gaps to lock AGC
+5. 🔲 **Pre-emphasis** — start first burst at low amplitude, ramp up for subsequent bursts
+6. 🔲 **Further throughput** — CP=16 (176 Hz sym rate), more subcarriers
 
 ### Relevant Files
 - `src/physical/ofdm.py` — OFDM modem. Channel threshold 0.01, CFO clamp ±0.05 (was ±0.5), PLL β=0.08, leak=0.999, slope clip ±0.02
-- `src/config.py` — `ModulationConfig.output_amplitude=0.08`, `OfdmConfig`: CP=32, SC=9–43, no pilots, QPSK, FFT=256, preamble=4
+- `src/config.py` — `ModulationConfig.output_amplitude=0.08`, `OfdmConfig`: CP=32, SC=9–43, no pilots, QPSK, FFT=256, preamble=4. `FrameConfig.payload_size=442`
 - `examples/demo_tx.py` — Single-burst TX: reads file, frames, modulates, plays, exits
 - `examples/demo_rx.py` — Single-burst RX: listens for preamble, demodulates all symbols, parses frames, writes payload to stdout
 - `examples/demo_pipeline.py` — Convenience launcher: starts RX + optional ffplay, runs TX, waits, cleans up
