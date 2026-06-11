@@ -74,7 +74,10 @@ def demo_tx(config, input_file=None):
 
     stream = AudioStream(config.audio, callback_tx=tx_cb)
     stream.start("tx")
-    time.sleep(total_dur + 1.0)
+    # Wait until all audio has been consumed by the callback
+    deadline = time.time() + total_dur + 10.0
+    while time.time() < deadline and tx_pos[0] < len(audio):
+        time.sleep(0.1)
     stream.stop()
 
     logger.info("TX done")

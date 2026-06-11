@@ -5,6 +5,7 @@ demodulates each frame, parses frames, and writes payload bytes to stdout.
 """
 
 import logging
+import signal
 import sys
 import time
 
@@ -37,7 +38,15 @@ def demo_rx(config, output_file=None):
     output_stream = open(output_file, "wb") if output_file else sys.stdout.buffer
     total_received = 0
     n_frames = 0
-    search_pos = 0  # byte position in buf to search from
+    search_pos = 0
+    running = True
+
+    def shutdown(_signum=None, _frame=None):
+        nonlocal running
+        running = False
+
+    signal.signal(signal.SIGINT, shutdown)
+    signal.signal(signal.SIGTERM, shutdown)
 
     def rx_cb(samples, _time_info):
         rx_q.append(samples.copy())
@@ -49,7 +58,7 @@ def demo_rx(config, output_file=None):
     t0 = time.time()
 
     try:
-        while time.time() - t0 < LISTEN_TIMEOUT:
+        while running and time.time() - t0 < LISTEN_TIMEOUT:
             time.sleep(0.02)
             while rx_q:
                 buf = np.concatenate([buf, rx_q.pop(0)])
@@ -57,7 +66,6 @@ def demo_rx(config, output_file=None):
             if len(buf) < search_pos + frame_samples:
                 continue
 
-            # Cross-correlation from search_pos
             search_buf = buf[search_pos:]
             xcorr = np.convolve(search_buf, demod._preamble_audio[::-1],
                                 mode="valid")
@@ -70,19 +78,16 @@ def demo_rx(config, output_file=None):
             se = float(np.dot(seg, seg))
             npk = float(xcorr_abs[peak]) / (np.sqrt(pe * se) + 1e-10)
             if npk < preamble_thresh:
-                # No preamble found — keep accumulating, advance search_pos to
-                # avoid re-scanning old data (but leave a frame window for overlap)
-                search_pos = max(0, len(buf) - frame_samples)
+                search_pos += int(sym_len * 0.5)
                 continue
 
             abs_pos = search_pos + peak
 
-            # Extract exactly one frame: preamble + margin + data
             margin = int(sym_len * 0.5)
             chunk_start = max(0, abs_pos - margin)
             chunk_end = abs_pos + frame_samples + 4
             if chunk_end > len(buf):
-                continue  # wait for more data
+                continue
             chunk = buf[chunk_start:chunk_end]
 
             bits = demod.process_samples(chunk)
@@ -105,27 +110,14 @@ def demo_rx(config, output_file=None):
                                     seq, len(payload), total_received, epoch)
 
             if success:
-                plen_start = getattr(demod, '_last_preamble_start', None)
-                if plen_start is not None:
-                    data_syms = len(bits) // demod.data_bits_per_sym
-                    search_pos = chunk_start + plen_start + plen + data_syms * sym_len
-                    search_pos = int(search_pos)
-                else:
-                    search_pos = abs_pos + frame_samples
+                search_pos = abs_pos + frame_samples
             else:
-                logger.warning("Frame skipped at t=%.1fs (npk=%.3f, buf=%d, abs_pos=%d)",
-                               time.time() - t0, npk, len(buf), abs_pos)
-                search_pos = abs_pos + frame_samples  # skip whole frame on failure
+                logger.warning("Frame fail at t=%.1fs (npk=%.3f, n=%d)",
+                               time.time() - t0, npk, n_frames)
+                search_pos = abs_pos + frame_samples
 
-            # Prune old data to keep buffer bounded
-            if search_pos > 2 * frame_samples:
-                buf = buf[search_pos:]
-                search_pos = 0
-                logger.info("Buffer pruned: %d samples remaining", len(buf))
-
-    except KeyboardInterrupt:
-        pass
     finally:
+        output_stream.flush()
         stream.stop()
         if output_file:
             output_stream.close()
