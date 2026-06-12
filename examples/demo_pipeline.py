@@ -42,12 +42,26 @@ def main():
     input_path = args.input
     if not os.path.exists(input_path):
         print(f"Generating test clip: {input_path}", flush=True)
-        c = Config()
-        ps = c.frame.payload_size
-        n = 68
-        with open(input_path, "wb") as f:
-            f.write(bytes(i % 256 for i in range(n * ps)))
-        print(f"  {n} frames, {n * ps} B", flush=True)
+        shrek_source = os.path.normpath(os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "..", "absolute_smallest_shrek_v2_stripped.webm"))
+        if os.path.exists(shrek_source):
+            c = Config()
+            ps = c.frame.payload_size
+            n = 68
+            with open(shrek_source, "rb") as src:
+                data = src.read(n * ps)
+                data += b"\x00" * (n * ps - len(data))
+            with open(input_path, "wb") as f:
+                f.write(data)
+            print(f"  {n} frames from {shrek_source}", flush=True)
+        else:
+            print("  Shrek source not found — using random test data", flush=True)
+            c = Config()
+            ps = c.frame.payload_size
+            n = 68
+            with open(input_path, "wb") as f:
+                f.write(bytes(i % 256 for i in range(n * ps)))
 
     # --- start receiver ---
     rx_proc = subprocess.Popen(
