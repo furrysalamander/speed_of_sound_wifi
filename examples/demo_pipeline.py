@@ -40,33 +40,33 @@ def main():
 
     # --- prepare payload ---
     input_path = args.input
-    n = 0
-    if not os.path.exists(input_path):
-        print(f"Generating test clip: {input_path}", flush=True)
-        shrek_source = os.path.normpath(os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            "..", "absolute_smallest_shrek_v2_stripped.webm"))
-        if os.path.exists(shrek_source):
-            c = Config()
-            ps = c.frame.payload_size
-            with open(shrek_source, "rb") as src:
-                data = src.read()
-            extra = (ps - len(data) % ps) % ps
-            data += b"\x00" * extra
-            with open(input_path, "wb") as f:
-                f.write(data)
-            n = len(data) // ps
-            print(f"  {n} frames ({n * ps:,} B) from {shrek_source}", flush=True)
-        else:
-            print("  Shrek source not found — using random test data", flush=True)
-            c = Config()
-            ps = c.frame.payload_size
-            n = 68
-            with open(input_path, "wb") as f:
-                f.write(bytes(i % 256 for i in range(n * ps)))
+    shrek_source = os.path.normpath(os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "..", "absolute_smallest_shrek_v2_stripped.webm"))
+    # Always regenerate from Shrek source when using the default path
+    should_gen = not os.path.exists(input_path) or input_path == DEFAULT_INPUT
+    if should_gen and os.path.exists(shrek_source):
+        c = Config()
+        ps = c.frame.payload_size
+        with open(shrek_source, "rb") as src:
+            data = src.read()
+        extra = (ps - len(data) % ps) % ps
+        data += b"\x00" * extra
+        with open(input_path, "wb") as f:
+            f.write(data)
+        n = len(data) // ps
+        print(f"Generated {n} frame clip ({n * ps:,} B) from {shrek_source}", flush=True)
+    elif not os.path.exists(input_path):
+        print("Shrek source not found — generating random test data", flush=True)
+        c = Config()
+        ps = c.frame.payload_size
+        n = 68
+        with open(input_path, "wb") as f:
+            f.write(bytes(i % 256 for i in range(n * ps)))
+        print(f"  {n} frames, {n * ps} B", flush=True)
     else:
-        ps = Config().frame.payload_size
-        n = (os.path.getsize(input_path) + ps - 1) // ps
+        n = (os.path.getsize(input_path) + Config().frame.payload_size - 1) // \
+            Config().frame.payload_size
 
     # --- start receiver ---
     rx_proc = subprocess.Popen(
