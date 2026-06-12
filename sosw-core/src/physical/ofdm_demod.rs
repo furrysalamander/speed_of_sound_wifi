@@ -129,7 +129,7 @@ impl OfdmDemodulator {
             0
         };
         let search_end = std::cmp::min(
-            search_start + self.preamble_samples_len,
+            search_start + self.preamble_samples_len * 2,
             samples.len(),
         );
 
@@ -184,19 +184,33 @@ impl OfdmDemodulator {
 
         let mut cfo_est = 0.0f32;
         if cfg.preamble_symbols >= 2 {
-            let sym0_fd = self.extract_ofdm_symbol(samples, preamble_start);
-            let sym1_fd = self.extract_ofdm_symbol(samples, preamble_start + total_sym_samples);
-            let mut sum_phase = 0.0f32;
-            let mut count = 0u32;
-            for sc_idx in sc_min..sc_min + n_sc {
-                let cross = sym0_fd[sc_idx] * sym1_fd[sc_idx].conj();
-                if cross.norm_sqr() > 0.0 {
-                    sum_phase += cross.arg();
-                    count += 1;
+            let mut cfo_phases = Vec::new();
+            for p_idx in 0..cfg.preamble_symbols - 1 {
+                let sym0 = self.extract_ofdm_symbol(samples, preamble_start + p_idx * total_sym_samples);
+                let sym1 = self.extract_ofdm_symbol(samples, preamble_start + (p_idx + 1) * total_sym_samples);
+                if p_idx >= self.preamble_symbols_fd.len() || p_idx + 1 >= self.preamble_symbols_fd.len() {
+                    continue;
+                }
+                let known0 = &self.preamble_symbols_fd[p_idx];
+                let known1 = &self.preamble_symbols_fd[p_idx + 1];
+                let mut sum_phase = 0.0f32;
+                let mut count = 0u32;
+                for (i, sc_idx) in (sc_min..sc_min + n_sc).enumerate() {
+                    if i >= known0.len() || i >= known1.len() { continue; }
+                    let h0 = sym0[sc_idx] / (known0[i] + num_complex::Complex32::new(1e-10, 0.0));
+                    let h1 = sym1[sc_idx] / (known1[i] + num_complex::Complex32::new(1e-10, 0.0));
+                    let cross = h1 * h0.conj();
+                    if cross.norm_sqr() > 0.0 {
+                        sum_phase += cross.arg();
+                        count += 1;
+                    }
+                }
+                if count > 0 {
+                    cfo_phases.push(sum_phase / count as f32);
                 }
             }
-            if count > 0 {
-                cfo_est = sum_phase / count as f32;
+            if !cfo_phases.is_empty() {
+                cfo_est = cfo_phases.iter().sum::<f32>() / cfo_phases.len() as f32;
                 cfo_est = cfo_est.clamp(-cfg.cfo_clamp, cfg.cfo_clamp);
             }
         }

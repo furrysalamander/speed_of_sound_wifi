@@ -178,8 +178,9 @@ fn ota_loopback(
     if tx_name == rx_name {
         eprintln!("  WARNING: TX and RX on same device — needs loopback cable");
     } else {
-        eprintln!("  NOTE: TX on '{}', RX on '{}'", tx_name, rx_name);
-        eprintln!("  Ensure speaker is audible to the microphone!");
+        eprintln!("  TX device: {} (detected)", tx_name);
+    eprintln!("  RX device: {} (detected)", rx_name);
+    eprintln!("  Ensure speaker is audible to the microphone!");
     }
 
     // RX buffer shared between callback and main thread
@@ -187,45 +188,93 @@ fn ota_loopback(
     let rx_buf_tx = rx_buf.clone();
     let rx_buf_rx = rx_buf.clone();
 
-    // TX: play audio samples, track completion
+    // TX: play audio samples — try f32 first, fall back to i16
     let audio_arc = Arc::new(audio.to_vec());
-    let audio_tx = audio_arc.clone();
+    let audio_tx_f32 = audio_arc.clone();
+    let audio_tx_i16 = audio_arc.clone();
+    let audio_keep = audio_arc.clone();
     let tx_offset = Arc::new(AtomicUsize::new(0));
     let tx_done = Arc::new(AtomicBool::new(false));
-    let tx_offset_cb = tx_offset.clone();
-    let tx_done_cb = tx_done.clone();
 
-    let tx_stream = tx_device.build_output_stream(
-        &tx_config,
-        move |data: &mut [f32], _info: &cpal::OutputCallbackInfo| {
-            let offset = tx_offset_cb.load(Ordering::SeqCst);
-            let remain = audio_tx.len().saturating_sub(offset);
-            let n = data.len().min(remain);
-            if n > 0 {
-                for (i, sample) in data.iter_mut().enumerate() {
-                    *sample = audio_tx.get(offset + i).copied().unwrap_or(0.0);
+    let tx_stream: cpal::Stream = {
+        let tx_off_f32 = tx_offset.clone();
+        let tx_dn_f32 = tx_done.clone();
+        let audio_f32 = audio_tx_f32.clone();
+        let result_f32 = tx_device.build_output_stream::<f32, _, _>(
+            &tx_config,
+            move |data: &mut [f32], _info: &cpal::OutputCallbackInfo| {
+                let off = tx_off_f32.load(Ordering::SeqCst);
+                let remain = audio_f32.len().saturating_sub(off);
+                let n = data.len().min(remain);
+                for (i, s) in data.iter_mut().enumerate() {
+                    *s = audio_f32.get(off + i).copied().unwrap_or(0.0);
                 }
-                tx_offset_cb.store(offset + n, Ordering::SeqCst);
-                if offset + n >= audio_tx.len() {
-                    tx_done_cb.store(true, Ordering::SeqCst);
-                }
+                tx_off_f32.store(off + n, Ordering::SeqCst);
+                if off + n >= audio_f32.len() { tx_dn_f32.store(true, Ordering::SeqCst); }
+            },
+            |err| eprintln!("TX error: {}", err),
+            None,
+        );
+        match result_f32 {
+            Ok(s) => s,
+            Err(_) => {
+                eprintln!("  F32 TX failed, trying I16...");
+                let tx_off_i16 = tx_offset.clone();
+                let tx_dn_i16 = tx_done.clone();
+                let audio_i16 = audio_tx_i16.clone();
+                tx_device.build_output_stream::<i16, _, _>(
+                    &tx_config,
+                    move |data: &mut [i16], _info: &cpal::OutputCallbackInfo| {
+                        let off = tx_off_i16.load(Ordering::SeqCst);
+                        let remain = audio_i16.len().saturating_sub(off);
+                        let n = data.len().min(remain);
+                        for (i, s) in data.iter_mut().enumerate() {
+                            *s = (audio_i16.get(off + i).copied().unwrap_or(0.0) * 32767.0) as i16;
+                        }
+                        tx_off_i16.store(off + n, Ordering::SeqCst);
+                        if off + n >= audio_i16.len() { tx_dn_i16.store(true, Ordering::SeqCst); }
+                    },
+                    |err| eprintln!("TX error: {}", err),
+                    None,
+                )?
             }
-        },
-        |err| eprintln!("TX error: {}", err),
-        None,
-    )?;
+        }
+    };
 
-    // RX: capture samples into shared buffer
-    let rx_stream = rx_device.build_input_stream(
-        &rx_config,
-        move |data: &[f32], _info: &cpal::InputCallbackInfo| {
-            if let Ok(mut buf) = rx_buf_tx.lock() {
-                buf.extend_from_slice(data);
+    // RX: capture samples — try f32 first, fall back to i16 with conversion
+    let rx_stream: cpal::Stream = {
+        let rx_buf_tx_i16 = rx_buf_tx.clone();
+        let result_f32 = rx_device.build_input_stream(
+            &rx_config,
+            move |data: &[f32], _info: &cpal::InputCallbackInfo| {
+                if let Ok(mut buf) = rx_buf_tx.lock() {
+                    buf.extend_from_slice(data);
+                }
+            },
+            |err| eprintln!("RX error: {}", err),
+            None,
+        );
+        match result_f32 {
+            Ok(s) => s,
+            Err(err_f32) => {
+                eprintln!("  F32 RX failed ({:?}), trying I16...", err_f32);
+                let rx_buf_tx_i16 = rx_buf_rx.clone();
+                rx_device.build_input_stream::<i16, _, _>(
+                    &rx_config,
+                    move |data: &[i16], _info: &cpal::InputCallbackInfo| {
+                        if let Ok(mut buf) = rx_buf_tx_i16.lock() {
+                            // Convert i16 to f32
+                            for &s in data {
+                                buf.push(s as f32 / 32768.0);
+                            }
+                        }
+                    },
+                    |err| eprintln!("RX error: {}", err),
+                    None,
+                )?
             }
-        },
-        |err| eprintln!("RX error: {}", err),
-        None,
-    )?;
+        }
+    };
 
     // Start RX first, then TX (with small gap for sync)
     rx_stream.play()?;
@@ -250,11 +299,16 @@ fn ota_loopback(
     let captured = rx_buf_rx.lock().unwrap().clone();
     eprintln!("  Captured: {:.1}s ({} samples)", captured.len() as f64 / sample_rate as f64, captured.len());
 
+    // Check signal amplitude
+    let max_amp = captured.iter().map(|&s| s.abs()).fold(0.0f32, f32::max);
+    let rms = (captured.iter().map(|&s| s * s).sum::<f32>() / captured.len() as f32).sqrt();
+    eprintln!("  Captured audio: max={:.4}, RMS={:.6}", max_amp, rms);
+
     if captured.len() < config.preamble_samples() {
         anyhow::bail!("Too little audio captured ({} samples, need >{})", captured.len(), config.preamble_samples());
     }
 
-    // Demodulate
+    // Demodulate — search the full buffer, not chunked
     let mut demod = OfdmDemodulator::new(config);
     let mut received_frames = Vec::new();
     let mut search_pos = 0usize;
@@ -263,19 +317,60 @@ fn ota_loopback(
     let data_syms = (config.payload_size * 8 + bits_per_sym - 1) / bits_per_sym;
     let frame_len = (config.preamble_symbols + data_syms) * config.symbol_duration_samples();
 
-    for _ in 0..n_frames {
-        if search_pos >= captured.len() {
+    // First, try to find preamble in the raw audio using cross-correlation
+    // to identify where the signal actually starts
+    use sosw_core::physical::preamble;
+    let preamble_raw = preamble::generate_preamble_audio(config);
+    let corr = preamble::compute_cross_correlation(&captured, &preamble_raw);
+    let max_corr = corr.iter().cloned().fold(0.0f32, f32::max);
+    let min_corr = corr.iter().cloned().fold(f32::MAX, f32::min);
+    let mean_val = if corr.is_empty() { 0.0 } else { corr.iter().sum::<f32>() / corr.len() as f32 };
+    let preamble_energy: f32 = preamble_raw.iter().map(|&s| s * s).sum::<f32>().max(1e-12);
+    eprintln!("  Raw correlation: max={:.4} min={:.4} mean={:.6} (preamble_energy={:.1})", max_corr, min_corr, mean_val, preamble_energy);
+
+    if !corr.is_empty() {
+        let peak_idx = corr.iter().enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, _)| i).unwrap_or(0);
+        let signal_energy: f32 = captured.iter().map(|&s| s * s).sum::<f32>().max(1e-12);
+        let norm_peak = corr[peak_idx] / (preamble_energy * signal_energy).sqrt();
+        eprintln!("  Peak at offset {} samples ({:.2}s): norm={:.6}", 
+                  peak_idx, peak_idx as f64 / config.sample_rate as f64, norm_peak);
+
+        // Also check energy of the signal around the peak
+        let win_start = peak_idx;
+        let win_end = std::cmp::min(win_start + preamble_raw.len(), captured.len());
+        let win_energy: f32 = captured[win_start..win_end].iter().map(|&s| s * s).sum::<f32>().max(1e-12);
+        let local_norm = corr[peak_idx] / (preamble_energy * win_energy).sqrt();
+        eprintln!("  Local energy at peak: {:.6}, normalized: {:.6}", win_energy, local_norm);
+    }
+
+    // Use a sliding window approach: process the full audio in large overlapping chunks
+    let chunk_stride = frame_len; // advance by one frame at a time
+    let chunk_size = frame_len + config.preamble_samples() * 2; // room for preamble anywhere
+
+    while search_pos < captured.len() {
+        if received_frames.len() / config.payload_size >= n_frames {
             break;
         }
-        let chunk_end = std::cmp::min(search_pos + frame_len, captured.len());
+        let chunk_end = std::cmp::min(search_pos + chunk_size, captured.len());
+        if chunk_end - search_pos < config.preamble_samples() + config.symbol_duration_samples() {
+            break;
+        }
         let mut padded: Vec<f32> = captured[search_pos..chunk_end].to_vec();
-        padded.extend(std::iter::repeat(0.0f32).take(config.symbol_duration_samples() * 6));
+        padded.extend(std::iter::repeat(0.0f32).take(config.symbol_duration_samples() * 4));
 
         if let Some(result) = demod.process_samples(&padded) {
             let n = result.bytes.len().min(config.payload_size);
+            eprintln!("  [ota] Frame {}: peak={:.4} cfo={:.4} |H|={:.6} bytes={}",
+                      received_frames.len() / config.payload_size,
+                      result.preamble_peak, result.cfo_rad_per_sym,
+                      result.mean_h_magnitude, result.bytes.len());
             received_frames.extend_from_slice(&result.bytes[..n]);
+            search_pos += frame_len;
+        } else {
+            search_pos += chunk_stride / 4;
         }
-        search_pos += frame_len;
         demod.reset();
     }
 
@@ -315,6 +410,10 @@ fn software_loopback(config: &Config, audio: &[f32], snr_db: f32) -> anyhow::Res
 
         if let Some(result) = demod.process_samples(&padded) {
             let n = result.bytes.len().min(config.payload_size);
+            eprintln!("  [sw] Frame {}: peak={:.4} cfo={:.4} |H|={:.6} bytes={}",
+                      received.len() / config.payload_size.max(1),
+                      result.preamble_peak, result.cfo_rad_per_sym,
+                      result.mean_h_magnitude, result.bytes.len());
             received.extend_from_slice(&result.bytes[..n]);
         }
         demod.reset();
@@ -332,7 +431,8 @@ fn find_device(host: &cpal::Host, name: &str, input: bool) -> anyhow::Result<cpa
 
     let lower = name.to_lowercase();
 
-    // Try exact match first
+
+    // Phase 1: exact match
     for device in &devices {
         if let Ok(dn) = device.name() {
             if dn.to_lowercase() == lower {
@@ -341,14 +441,29 @@ fn find_device(host: &cpal::Host, name: &str, input: bool) -> anyhow::Result<cpa
         }
     }
 
-    // Then substring (whole name contains query, or vice versa)
+    // Phase 2: device name STARTS WITH the query (e.g. "plughw:CARD=..." starts with "plughw:")
     for device in &devices {
         if let Ok(dn) = device.name() {
-            let dn_lower = dn.to_lowercase();
-            if dn_lower.contains(&lower) || lower.contains(&dn_lower) {
+            if dn.to_lowercase().starts_with(&lower) {
                 return Ok(device.clone());
             }
         }
+    }
+
+    // Phase 3: query is a substring of the device name (prefer longer/more specific matches)
+    let mut candidates: Vec<(usize, cpal::Device)> = Vec::new();
+    for device in &devices {
+        if let Ok(dn) = device.name() {
+            let dn_lower = dn.to_lowercase();
+            if dn_lower.contains(&lower) {
+                // Prefer longer device names (more specific match)
+                candidates.push((dn_lower.len(), device.clone()));
+            }
+        }
+    }
+    candidates.sort_by(|a, b| b.0.cmp(&a.0)); // longest match first
+    if let Some((_, dev)) = candidates.into_iter().next() {
+        return Ok(dev);
     }
 
     // Fall back to default
