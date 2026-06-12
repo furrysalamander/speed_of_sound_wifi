@@ -7,11 +7,27 @@ use wasm_bindgen::JsCast;
 
 // ── RX ──────────────────────────────────────────────────────────
 
+const WORKLET_JS: &str = r#"
+class SoswRxProcessor extends AudioWorkletProcessor {
+    constructor() {
+        super();
+    }
+    process(inputs, outputs, parameters) {
+        const input = inputs[0];
+        if (input && input[0] && input[0] instanceof Float32Array) {
+            this.port.postMessage(input[0], [input[0].buffer]);
+        }
+        return true;
+    }
+}
+registerProcessor('sosw-rx', SoswRxProcessor);
+"#;
+
 pub struct RxHandle {
     demodulator: OfdmDemodulator,
     buffer: std::cell::RefCell<Vec<f32>>,
     audio_ctx: web_sys::AudioContext,
-    _processor: web_sys::ScriptProcessorNode,
+    _worklet: web_sys::AudioWorkletNode,
     _source: web_sys::MediaStreamAudioSourceNode,
 }
 
@@ -60,35 +76,50 @@ pub async fn start_rx() -> Result<RxHandle, JsValue> {
 
     let source = ctx.create_media_stream_source(&stream)?;
 
-    let buffer_size = 2048u32;
-    let processor = ctx
-        .create_script_processor_with_buffer_size_and_number_of_input_channels_and_number_of_output_channels(
-            buffer_size, 1, 1,
-        )?;
+    // Inline AudioWorklet processor
+    let parts = js_sys::Array::new();
+    parts.push(&wasm_bindgen::JsValue::from_str(WORKLET_JS));
+    let blob = web_sys::Blob::new_with_str_sequence(&parts)?;
+    let url = web_sys::Url::create_object_url_with_blob(&blob)?;
+    let module_promise = ctx.audio_worklet()?.add_module(&url)?;
+    wasm_bindgen_futures::JsFuture::from(module_promise).await?;
+    web_sys::Url::revoke_object_url(&url)?;
 
     let buffer = std::cell::RefCell::new(Vec::<f32>::new());
-
     let buf_ptr = &buffer as *const std::cell::RefCell<Vec<f32>>;
 
-    let closure = Closure::<dyn FnMut(web_sys::AudioProcessingEvent)>::new(
-        move |event: web_sys::AudioProcessingEvent| {
-            if let Ok(input) = event.input_buffer() {
-                if let Ok(data) = input.get_channel_data(0) {
-                    unsafe {
-                        if let Some(b) = buf_ptr.as_ref() {
-                            b.borrow_mut().extend_from_slice(&data);
-                        }
+    let options = {
+        #[allow(unused_mut)]
+        let mut opt = web_sys::AudioWorkletNodeOptions::new();
+        opt.set_number_of_inputs(1);
+        opt.set_number_of_outputs(0);
+        opt
+    };
+    let worklet = web_sys::AudioWorkletNode::new_with_options(
+        ctx.unchecked_ref::<web_sys::BaseAudioContext>(),
+        "sosw-rx",
+        &options,
+    )?;
+
+    let on_msg = Closure::<dyn FnMut(web_sys::MessageEvent)>::new(
+        move |event: web_sys::MessageEvent| {
+            if let Some(data) = event.data().dyn_into::<js_sys::Float32Array>().ok() {
+                unsafe {
+                    if let Some(b) = buf_ptr.as_ref() {
+                        let mut b = b.borrow_mut();
+                        let len = data.length() as usize;
+                        let start = b.len();
+                        b.resize(start + len, 0.0);
+                        data.copy_to(&mut b[start..]);
                     }
                 }
             }
         },
     );
+    worklet.port()?.set_onmessage(Some(on_msg.as_ref().unchecked_ref()));
+    on_msg.forget();
 
-    processor.set_onaudioprocess(Some(closure.as_ref().unchecked_ref()));
-    closure.forget();
-
-    source.connect_with_audio_node(&processor)?;
-    processor.connect_with_audio_node(&ctx.destination())?;
+    source.connect_with_audio_node(&worklet)?;
 
     let demodulator = OfdmDemodulator::new(&_config);
 
@@ -96,7 +127,7 @@ pub async fn start_rx() -> Result<RxHandle, JsValue> {
         demodulator,
         buffer,
         audio_ctx: ctx,
-        _processor: processor,
+        _worklet: worklet,
         _source: source,
     })
 }

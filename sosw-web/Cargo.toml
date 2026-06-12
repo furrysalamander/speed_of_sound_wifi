@@ -12,9 +12,9 @@ leptos = { version = "0.7", features = ["csr"] }
 wasm-bindgen = "0.2"
 getrandom = { version = "0.3", features = ["wasm_js"] }
 web-sys = { version = "0.3", features = [
-    "AudioContext", "AudioContextOptions", "ScriptProcessorNode",
-    "AudioProcessingEvent",
+    "AudioContext", "AudioContextOptions",
     "AudioBuffer", "AudioBufferSourceNode",
+    "AudioWorklet", "AudioWorkletNode", "AudioWorkletNodeOptions",
     "MediaStream", "MediaStreamAudioSourceNode", "MediaDevices",
     "HtmlCanvasElement", "CanvasRenderingContext2d", "ImageData",
     "AudioNode", "AudioDestinationNode",
@@ -22,6 +22,8 @@ web-sys = { version = "0.3", features = [
     "Window", "Navigator",
     "HtmlElement", "Document", "Element",
     "FileReader", "File", "Blob", "FileList", "HtmlInputElement",
+    "Url",
+    "MessagePort",
 ] }
 js-sys = "0.3"
 wasm-bindgen-futures = "0.4"
