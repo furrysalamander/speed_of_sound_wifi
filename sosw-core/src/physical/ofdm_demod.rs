@@ -13,6 +13,7 @@ pub struct DemodResult {
     pub cfo_rad_per_sym: f32,
     pub mean_h_magnitude: f32,
     pub per_sc_h: Vec<f32>,
+    pub consumed_samples: usize,
 }
 
 pub struct OfdmDemodulator {
@@ -325,12 +326,14 @@ impl OfdmDemodulator {
             0.0
         };
 
+        let consumed_samples = preamble_start + (cfg.preamble_symbols + n_data) * total_sym_samples;
         Some(DemodResult {
             bytes: descrambled,
             preamble_peak: norm_peak,
             cfo_rad_per_sym: cfo_est,
             mean_h_magnitude,
             per_sc_h,
+            consumed_samples,
         })
     }
 

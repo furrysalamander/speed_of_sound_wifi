@@ -1,0 +1,19 @@
+[package]
+name = "sosw-tap"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "sosw-tap"
+path = "src/main.rs"
+
+[dependencies]
+sosw-core = { path = "../sosw-core" }
+tappers = "0.4"
+cpal = { version = "0.18", features = ["pulseaudio"] }
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt", "macros", "time", "sync", "io-util"] }
+anyhow = "1"
+rand = "0.9"
+log = "0.4"
+env_logger = "0.11"

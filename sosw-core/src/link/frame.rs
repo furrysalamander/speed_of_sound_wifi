@@ -27,7 +27,10 @@ impl FrameAssembler {
     }
 
     pub fn assemble_frame(&mut self, payload: &[u8]) -> Vec<u8> {
-        let frame_type: u8 = 0;
+        self.assemble_frame_with_type(payload, 0)
+    }
+
+    pub fn assemble_frame_with_type(&mut self, payload: &[u8], frame_type: u8) -> Vec<u8> {
         let payload_len = payload.len() as u16;
         let seq = self.sequence_number;
         self.sequence_number = self.sequence_number.wrapping_add(1);
