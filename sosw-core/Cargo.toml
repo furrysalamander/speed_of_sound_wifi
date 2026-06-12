@@ -9,6 +9,7 @@ ndarray = "0.17"
 num-complex = { version = "0.4", features = ["std"] }
 rand = "0.9"
 rand_chacha = "0.9"
+getrandom = { version = "0.3", features = ["wasm_js"] }
 crc = "3"
 serde = { version = "1", features = ["derive"] }
 log = "0.4"
