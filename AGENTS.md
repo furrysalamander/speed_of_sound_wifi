@@ -64,7 +64,7 @@ tests/framing_extended_tests.py .. 20 passed
 tests/param_sweep.rs ............. 4 passed  (software sweep: FFT 128-512, CP 16-64, SC 1-127)
 tests/debug_fft.rs ............... 1 passed
 tests/debug_preamble.rs .......... 1 passed
-Total: 66 tests
+Total: 66 tests  (plus OTA: 600/600 frames, 5 presets × 120 frames, 100% RS-correctable)
 ```
 
 ## Config Presets
@@ -79,7 +79,7 @@ Total: 66 tests
 | Ultrasonic | 256 | 32 | 80–120 | 15.0–22.5 kHz | 167 | 51 | 354 ms | 13.7 kbps |
 | Ultrawide | 256 | 16 | 5–110 | 0.9–20.6 kHz | 176 | 20 | 159 ms | 37.4 kbps |
 
-All presets verified by software roundtrip test (`param_sweep.rs`) and OTA validation (`ota-validate`).
+All presets verified by software roundtrip test (`param_sweep.rs`), OTA validation (`ota-validate`), and Phy API loopback (`latency_test`).
 
 ## Debug Tab Features
 
@@ -109,9 +109,11 @@ All 5 presets verified with OTA loopback — **100% RS-correctable** on 30-frame
 - **Guard interval**: `sym_dur` silence between frames prevents cross-correlation false peaks from previous frame's random tail data
 - **`consumed_samples` stride**: Converges preamble offset to ~`guard` samples after 3 training frames, matching actual audio spacing with zero drift
 - **Training frames**: 3 dummy frames before data allow `consumed_samples` stride to converge (coarse energy search triggers on lead-in ambient noise, causing false preamble offset on frame 0)
+- **FrameParser CRC re-check**: `try_extract_frame` used raw (potentially errored) sync bytes in the re-encode CRC check after RS decode. Sync bytes from the first OFDM data symbol can have bit errors even with |H|=0.75. Fixed by using known `SYNC_PATTERN` constant instead of `&self.buffer[..sync_end]`.
+- **Phy API `rx_skip`**: Persistent audio streams cause `energy_coarse_search` to false-trigger on ambient noise at the batch front, missing the preamble. Drain only `preamble_samples/4` (not `consumed`) on invalid frames so the real echo stays in the batch until detected. Batch cap raised to `frame_samples * 200` to prevent small-frame presets from flushing the echo.
 - **`data_symbols_per_frame`**: Exact-fit to FrameAssembler output for all presets (was over/under-provisioned for 4 of 5 presets)
 - **RS budget**: Correctly uses `rs_nsym/2` instead of hardcoded 16 per block
-- **Chunk margin**: `frame_samples + 6×guard` ensures first frame's preamble offset (~576 sample audio latency) doesn't truncate data symbols
+- **Chunk margin**: `frame_samples + 6×guard` ensures first frame's preamble offset (~1440 samples / 30ms audio latency) doesn't truncate data symbols
 
 Run your own sweep: `cargo run --release -p sosw-cli --bin ota-validate -- --preset <name> --frames 20 --tx-device <tx> --rx-device <rx>`
 
@@ -122,15 +124,16 @@ Run your own sweep: `cargo run --release -p sosw-cli --bin ota-validate -- --pre
 | Ultrawide | 37.4 kbps | 442 B | 159 ms | ~2 kbps |
 | High Baud | 18.7 kbps | 128 B | 141 ms | ~2 kbps |
 
-MAC timings (300 ms DIFS, 60 ms slots, 700 ms ACK timeout) are the real bottleneck, not PHY capacity.
+MAC timings (300 ms DIFS, 60 ms slots, 700 ms ACK timeout) are the real bottleneck, not PHY capacity. Round-trip audio path latency through PipeWire (Ubuntu defaults, quantum=1024, BufferSize=Fixed(256)) is ~47ms.
 
 ## Next Steps
 
 1. ~~**CLI crate**: cpal audio I/O for desktop TX/RX testing~~ (done)
 2. ~~**WASM crate**: Leptos web app with AudioWorklet~~ (done: RX, TX, Debug tabs)
 3. ~~**OTA validation**: Rust OTA matches Python baseline; all 5 presets verified~~ (done)
-4. **sosw-tap**: Ethernet-over-sound with CSMA/CA MAC
-5. **WASM cross-device testing**: Validate ultrasonic presets with high-frequency hardware
+4. ~~**Phy API loopback**: All 5 presets verified through persistent cpal streams~~ (done)
+5. **sosw-tap**: Ethernet-over-sound with CSMA/CA MAC
+6. **WASM cross-device testing**: Validate ultrasonic presets with high-frequency hardware
 
 ## Data Flow
 

@@ -177,8 +177,10 @@ impl Mac {
                         let frag = &self.fragments[self.frag_idx];
                         let audio = self.phy.transmit_frame(frag, FRAME_TYPE_DATA);
                         let sample_count = audio.len();
+                        self.phy.begin_tx_mute();
                         self.phy.play_samples(&audio);
                         self.phy.wait_tx_done(sample_count);
+                        self.phy.end_tx_mute();
 
                         self.tx_frame_id = FragmentHeader::decode(frag)
                             .map(|h| h.frame_id)
@@ -250,7 +252,9 @@ impl Mac {
         let payload = [dst, self.config.node_id, frame_id, frag_index];
         let audio = self.phy.transmit_frame(&payload, FRAME_TYPE_ACK);
         let sc = audio.len();
+        self.phy.begin_tx_mute();
         self.phy.play_samples(&audio);
         self.phy.wait_tx_done(sc);
+        self.phy.end_tx_mute();
     }
 }

@@ -194,7 +194,7 @@ impl FrameParser {
                 let (decoded, success) = self.fec.decode(fec_data);
                 if decoded.len() >= 4 {
                     let reencoded = self.fec.encode(&decoded);
-                    let mut crc_check = Vec::from(&self.buffer[..sync_end]);
+                    let mut crc_check = Vec::from(&SYNC_PATTERN[..sync_end]);
                     crc_check.extend_from_slice(&reencoded);
                     if crc::verify_crc32(&crc_check, crc_bytes) {
                         let frame_type = (decoded[0] >> 4) & 0x0F;
