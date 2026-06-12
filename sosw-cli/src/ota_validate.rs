@@ -80,10 +80,18 @@ fn main() -> anyhow::Result<()> {
         };
         if recv == sent {
             matching_frames += 1;
-        } else if i < 5 {
+        } else if i < 3 {
             let xor: Vec<u8> = sent.iter().zip(recv.iter()).map(|(a, b)| a ^ b).collect();
             let diff_count = sent.iter().zip(recv.iter()).filter(|(a, b)| a != b).count();
-            eprintln!("  Frame {}: {} / {} bytes differ (xor first 8: {:02x?})", i, diff_count, fps, &xor[..8.min(xor.len())]);
+            // Find bit error rate within the first 40 bytes
+            let bit_xor: u32 = sent.iter().zip(recv.iter()).take(40)
+                .map(|(a, b)| (a ^ b).count_ones()).sum();
+            eprintln!("  Frame {}: {} / {} bytes differ ({} bit errors in first 40 bytes, xor first 8: {:02x?})",
+                      i, diff_count, fps, bit_xor, &xor[..8.min(xor.len())]);
+            if i == 0 {
+                eprintln!("    Expected first 40: {:02x?}", &sent[..40]);
+                eprintln!("    Received first 40: {:02x?}", &recv[..40.min(recv.len())]);
+            }
         }
     }
 
@@ -189,10 +197,17 @@ fn ota_loopback(
     let rx_buf_rx = rx_buf.clone();
 
     // TX: play audio samples — try f32 first, fall back to i16
-    let audio_arc = Arc::new(audio.to_vec());
+    // Scale audio to avoid clipping on PulseAudio paths
+    let max_tx = audio.iter().map(|&s| s.abs()).fold(0.0f32, f32::max);
+    let tx_scale = if max_tx > 0.0 { (0.02 / max_tx).min(1.0) } else { 1.0 };
+    let scaled_audio: Vec<f32> = audio.iter().map(|&s| s * tx_scale).collect();
+    let audio_arc = Arc::new(scaled_audio);
     let audio_tx_f32 = audio_arc.clone();
     let audio_tx_i16 = audio_arc.clone();
     let audio_keep = audio_arc.clone();
+    if tx_scale < 0.99 {
+        eprintln!("  TX scale: {:.4} (prevent clipping)", tx_scale);
+    }
     let tx_offset = Arc::new(AtomicUsize::new(0));
     let tx_done = Arc::new(AtomicBool::new(false));
 
@@ -299,10 +314,10 @@ fn ota_loopback(
     let captured = rx_buf_rx.lock().unwrap().clone();
     eprintln!("  Captured: {:.1}s ({} samples)", captured.len() as f64 / sample_rate as f64, captured.len());
 
-    // Check signal amplitude
+    // Check signal amplitude and approximate SNR
     let max_amp = captured.iter().map(|&s| s.abs()).fold(0.0f32, f32::max);
     let rms = (captured.iter().map(|&s| s * s).sum::<f32>() / captured.len() as f32).sqrt();
-    eprintln!("  Captured audio: max={:.4}, RMS={:.6}", max_amp, rms);
+    eprintln!("  Captured: max={:.4} RMS={:.6}", max_amp, rms);
 
     if captured.len() < config.preamble_samples() {
         anyhow::bail!("Too little audio captured ({} samples, need >{})", captured.len(), config.preamble_samples());

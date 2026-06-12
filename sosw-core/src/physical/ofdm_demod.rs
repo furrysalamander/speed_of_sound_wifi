@@ -300,11 +300,11 @@ impl OfdmDemodulator {
                 let slope_est = if den.abs() > 1e-12 { num / den } else { 0.0 };
                 let common_est = w_mean_y - slope_est * w_mean_k;
 
-                self.cfo_freq = cfg.pll_leak * self.cfo_freq
-                    + (1.0 - cfg.pll_leak) * common_est;
+                self.cfo_freq = cfg.pll_leak * self.cfo_freq + cfg.pll_beta * common_est;
                 self.cfo_freq = self.cfo_freq.clamp(-cfg.cfo_clamp, cfg.cfo_clamp);
 
                 self.dd_common += self.cfo_freq + cfg.dd_alpha * common_est;
+                self.dd_common = self.dd_common.sin().atan2(self.dd_common.cos());
                 self.dd_slope = (1.0 - cfg.slope_alpha) * self.dd_slope
                     + cfg.slope_alpha * slope_est;
                 self.dd_slope = self.dd_slope.clamp(-cfg.slope_clip, cfg.slope_clip);
