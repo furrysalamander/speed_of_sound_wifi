@@ -85,10 +85,13 @@ def demo_rx(config, output_file=None, save_failures_dir=None):
             margin = int(sym_len * 0.5)
 
             if n_frames == 0:
-                # Acquisition: search within 1 frame of search_pos to ensure
-                # we find the FIRST frame (not a later stronger one).
+                # Acquisition: search up to 1 frame ahead for the first
+                # preamble. Start a small margin before search_pos to catch
+                # µs-scale drift that places the preamble just before it.
+                pw = int(sym_len * 0.5)
                 win = int(frame_samples + sym_len)
-                search_buf = buf[search_pos:search_pos + win]
+                sb_start = max(0, search_pos - pw)
+                search_buf = buf[sb_start:sb_start + win]
                 if len(search_buf) < plen:
                     search_pos += int(sym_len * 0.5)
                     continue
@@ -105,7 +108,7 @@ def demo_rx(config, output_file=None, save_failures_dir=None):
                 if npk < preamble_thresh or se < 0.5:
                     search_pos += int(sym_len * 0.5)
                     continue
-                abs_pos = search_pos + peak
+                abs_pos = sb_start + peak
             else:
                 # Tracking: position-based — process_samples handles internal timing
                 abs_pos = search_pos
@@ -140,6 +143,11 @@ def demo_rx(config, output_file=None, save_failures_dir=None):
 
             if success:
                 search_pos = abs_pos + frame_samples
+            elif n_frames == 0:
+                # Acquisition: on failure, slide forward to find the real frame
+                logger.warning("Frame fail at t=%.1fs (npk=%.4f), acq sliding",
+                               time.time() - t0, npk)
+                search_pos += int(sym_len * 0.5)
             else:
                 logger.warning("Frame fail at t=%.1fs (npk=%.4f, n=%d)",
                                time.time() - t0, npk, n_frames)
