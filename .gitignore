@@ -14,7 +14,11 @@ venv/
 .DS_Store
 Thumbs.db
 
+# Rust
+target/
+
 # Project-specific
 absolute_smallest_shrek_v2_stripped.webm
 launch_opencode.sh
+debug_test.rs
 # STATUS.md

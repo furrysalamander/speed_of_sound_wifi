@@ -1,0 +1,8 @@
+[package]
+name = "sosw-cli"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sosw-core = { path = "../sosw-core" }
+clap = { version = "4", features = ["derive"] }

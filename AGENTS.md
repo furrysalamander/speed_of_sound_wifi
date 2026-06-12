@@ -1,273 +1,81 @@
-# OTA Testing Guide
-
-## Hardware Setup
-
-PC speaker → USB desk mic (0c76 USB PnP Audio Device), ~30 cm separation.
-
-### Find Device Names
-
-```bash
-python -m src.main --list-devices
-```
-
-Typical:
-```
-alsa_output.pci-0000_71_00.6.analog-stereo   (output, "analog-stereo")
-alsa_input.usb-0c76_USB_PnP_Audio-01.mono    (input, "USB_PnP")
-```
-
-## OFDM Implementation
-
-### Current Parameters
-
-| Parameter | Value | Notes |
-|-----------|-------|-------|
-| FFT size | 256 | 187.5 Hz subcarrier spacing |
-| CP length | 32 | 0.67 ms guard interval (sufficient for 30 cm desk path) |
-| Active subcarriers | 10-69 (60 total) | 1875-12938 Hz (avoids USB mic dip at 1200-1500 Hz) |
-| Subcarrier modulation | QPSK (2 bits) | Gray-coded, 120 bits/symbol |
-| Preamble | 8 OFDM symbols | Known QPSK, per-frame — wider autocorrelation lobe for drift tolerance |
-| Symbol duration | 288 samples (6 ms) | CP + FFT |
-| Symbol rate | 166.7 Hz | 48000/288 |
-| Data syms/frame | 35 | Computed dynamically from payload_size |
-| Frame time | 258 ms | 8 preamble + 35 data syms |
-| Payload per frame | 442 B | 2 RS(255,223) blocks, CRC-32 |
-
-### Throughput
-
-| Layer | Bits/sym | Symbol rate | Raw bps | Overhead | Net bps |
-|-------|----------|-------------|---------|----------|---------|
-| Modulation (60× QPSK) | 120 | 166.7 Hz | 20,000 | — | 20,000 |
-| OFDM (35 data / 43 total) | — | — | 20,000 | ×0.814 | 16,279 |
-| Framing (522B → 442B payload) | — | — | 16,279 | ×0.847 | 13,787 |
-| RS(32) FEC (223/255) | — | — | 13,787 | ×0.875 | 12,064 |
-
-The Shrek target is ~8.5 kbps, giving **1.6× headroom** with current config.
-
-### Phase Tracking
-
-**Decision-directed phase tracking** (`_dd_common`, `_dd_slope` in OfdmDemodulator):
-- After equalization and QPSK demap, re-encodes decisions and estimates residual phase error per subcarrier
-- Fits linear model (phase = a + b*(k - k_ref)) to separate common phase drift from timing offset
-- Exponential smoothing (alpha=0.05) filters noisy estimates
-- Correction applied to next symbol as `exp(-j*(a + b*(k - k_ref)))`
-- State reset per-frame (each call to `process_samples`)
-
-### Timing Recovery
-
-Uses **preamble cross-correlation** (not CP autocorrelation):
-- Demodulator stores the full time-domain preamble (generated identically to modulator)
-- Cross-correlates with incoming samples to find preamble start
-- Channel estimation uses zero-forcing from the 4 known preamble symbols
-- One-tap equalization per subcarrier for data symbols
-
-### Scrambler
-
-Data bytes are XOR-scrambled with `np.random.default_rng(seed=12345)` before modulation to avoid problematic bit patterns (e.g., the sync pattern `\xAA\x55...` creating all-same QPSK constellation symbols). Demod de-scrambles with the same PRNG after demapping.
-
-## Per-Frame Preamble Architecture
-
-Instead of one preamble for the entire burst, **each frame gets its own preamble** (4 OFDM syms):
-
-| Benefit | Description |
-|---------|-------------|
-| Unlimited duration | PLL resets per frame, no drift accumulation |
-| AGC immunity | Continuous audio prevents mic AGC gain changes |
-| Independent detection | If one frame is lost, subsequent frames unaffected |
-
-**Reliability boundary**: Each frame is independently detected. The channel is binary — received frames have exactly 0 byte errors, or are completely missed (preamble not detected or RS uncorrectable).
-
-### OTA Test Results (USB Mic, ~30 cm)
-
-| Duration | Frames | Received | Rate |
-|----------|--------|----------|------|
-| 30 s (68 frames) | 68/68 | 100% | Latest (SC 10-69, 60 SC, 8 preamble) |
-| 30 s (68 frames) | 66/68 | 97% | Previous (SC 10-69, 60 SC, 4 preamble) |
-| 30 s (68 frames) | 55/68 | 81% | Baseline (SC 9-43, 35 SC) |
-| 60 s (150 frames) | 141/150 | 94% | Best (SC 9-43, 4 preamble) |
-
-The improvement from 81% to 97% when moving to per-frame analysis (vs sequential grid alignment) indicates frames are detected independently but misalignment caused false negatives in earlier analysis.
-
-### Frame Loss Pattern (Historical)
-
-- **Losses were binary** during development: every received frame was byte-perfect; missing frames were completely absent
-- With **8 preamble symbols** + position tracking + lower detection threshold, 100% frame reception is achieved at 30 s
-- Loss was driven by two root causes, both now addressed:
-  1. **Autocorrelation null**: µs-scale timing drift (~4 samples) from TX/RX clock skew (7.5 ppm) placed the preamble at the null of the wideband OFDM autocorrelation. Fixed by increasing preamble from 4→8 symbols (wider lobe) and using ≤0.05 detection thresholds.
-  2. **Frame skipping**: global argmax over the full buffer found a later frame's stronger preamble. Fixed by position tracking after first acquisition.
-- Loss of frame 0 during acquisition was fixed by sliding 0.5 sym on decode failure (instead of advancing by frame_samples).
-
-## Commands
-
-### Software Round-Trip (No Hardware)
-
-```bash
-python -c "
-from src.config import Config; from src.physical.ofdm import *
-c=Config(); mod=OfdmModulator(c); dem=OfdmDemodulator(c)
-audio=mod.modulate_with_preamble(bytes(range(200)))
-bits=dem.process_samples(audio)
-r=dem.symbols_to_bytes(bits, 200) if bits is not None else b''
-print('OK' if r[:200]==bytes(range(200)) else 'FAIL')
-"
-```
-
-### Multi-Frame Software Round-Trip
-
-```bash
-python -c "
-from src.config import Config; from src.physical.ofdm import *
-from src.link.framing import FrameAssembler, FrameParser
-c=Config(); mod=OfdmModulator(c); dem=OfdmDemodulator(c)
-asm=FrameAssembler(c); parser=FrameParser(c)
-n=68; ps=c.frame.payload_size
-payload=bytes(i%256 for i in range(n*ps))
-framed=b''.join(asm.assemble_frame(payload[i*ps:(i+1)*ps]) for i in range(n))
-audio=mod.modulate_with_preamble(bytes(framed))
-bits=dem.process_samples(audio)
-byte_est=len(bits)//8+64
-decoded=dem.symbols_to_bytes(bits, byte_est)
-frames=parser.feed_bytes(decoded)
-recv=bytearray()
-for p,s,t,v in frames:
-    if v: recv.extend(p)
-print(f'{len(recv)}/{len(payload)} match={recv==payload}')
-"
-```
-
-### OTA Demo Pipeline
-
-```bash
-# Full pipeline: TX -> [OTA] -> RX -> ffplay
-python -m examples.demo_pipeline --input /tmp/shrek_test_30s.bin
-
-# To file (no ffplay):
-python -m examples.demo_pipeline --input /tmp/shrek_test_30s.bin --no-ffplay
-
-# Manual: terminal 1 (RX -> ffplay):
-python -m examples.demo_rx --output-name USB_PnP | ffplay -i pipe:0 -an -nodisp
-
-# Manual: terminal 2 (TX):
-python -m examples.demo_tx --input /tmp/shrek_test_30s.bin --input-name analog-stereo
-```
-
-### Reproducible OTA Test
-
-```bash
-python -m examples.test_ota_demo
-```
-
-### Prepare Test Clips
-
-```bash
-# Create a 30-second test clip (68 frames of 442 B from Shrek source):
-python -c "
-data = open('absolute_smallest_shrek_v2_stripped.webm', 'rb').read()
-ps = 442
-n = 68  # 30 seconds at 258 ms/frame
-data = data[:n * ps] + b'\x00' * (n * ps - len(data[:n * ps]))
-open('/tmp/shrek_test_30s.bin', 'wb').write(data)
-"
-
-# Or use any random data:
-python -c "
-from src.config import Config
-ps = Config().frame.payload_size
-data = bytes(i % 256 for i in range(68 * ps))
-open('/tmp/shrek_test_30s.bin', 'wb').write(data)
-"
-```
-
-### Unit Tests
-
-```bash
-python -m pytest tests/ -v
-```
-
-### List Audio Devices
-
-```bash
-python -m src.main --list-devices
-```
-
-## OTA Frequency Response (USB Mic 0c76)
-
-Measured via full-band OFDM preamble (SC 1-127, 8 syms). Speaker → mic OTA.
-
-| Range | |H| | Notes |
-|-------|------|-------|
-| SC 2-78 (375-14625 Hz) | -6 dB | Usable range |
-| SC 4-69 (750-12938 Hz) | -3 dB | Recommended range |
-| SC 7-9 (1312-1688 Hz) | ~-6 dB dip | The known 1200-1500 Hz USB mic notch |
-| SC 20 (3750 Hz) | peak (1.42) | Best channel response |
-| > SC 69 (12938 Hz) | > -3 dB rolloff | Below usable threshold |
-
-Current config uses SC 10-69 to stay within -3 dB band while avoiding the dip.
+# Speed of Sound WiFi — Rust Rewrite
 
 ## Architecture
 
-### Frame Format
-
-Each frame: 522 total bytes
 ```
-[8 B sync] [4 B header] [RS(255,223) block 1: 223 data + 32 parity]
-[RS(255,223) block 2: 219 data + 32 parity] [4 B CRC-32]
+sosw-core/     — Core library (no I/O deps)
+sosw-cli/      — Desktop CLI (cpal audio)
+sosw-web/      — WASM web demo (Leptos)
 ```
 
-- `payload_size=442`: fills 2 RS blocks (223 + 219 data bytes)
-- `nsym=32`: corrects up to 16 byte errors per block (32 total per frame)
-- Sync pattern: `\xAA\x55\xAA\x55\xAA\x55\xAA\x55`
+## Build & Test
 
-### TX Flow (demo_tx.py)
+```bash
+# Core library
+cargo build -p sosw-core
+cargo test -p sosw-core
 
-1. Read input file
-2. Pad to payload_size boundary
-3. Register audio callback that generates frame audio on-the-fly
-4. For each frame: assemble (sync + RS + CRC), modulate with own preamble
-5. Generated frames stored in a buffer; new frames generated when callback consumes ahead
-6. Append 0.5 s silence after all frames generated
-7. Play via callback (audio stream)
-8. Poll `tx_pos[0]` until all samples consumed
+# CLI (desktop)
+cargo build -p sosw-cli
+cargo run -p sosw-cli -- --help
 
-### RX Flow (demo_rx.py)
+# Web (WASM)
+cd sosw-web && trunk serve
+cd sosw-web && trunk build --release
+```
 
-1. Continuous audio capture via callback
-2. Buffer grows (no pruning — pruning caused cumulative drift)
-3. Slide `search_pos` forward, correlate with `_preamble_audio` (reverse convolution)
-4. Find cross-correlation peak, compute normalized peak energy
-5. If `norm_peak >= 0.10`: extract chunk (margin + frame_samples + padding), demodulate
-6. `process_samples()` does: PLL init → per-symbol equalization → DD tracking → QPSK demap → descramble
-7. Parse bytes with FrameParser → if CRC valid → write payload to stdout
-8. Advance `search_pos` by `frame_samples` regardless of success
+## Core Library (`sosw-core`)
 
-### Key Design Decisions
+| Module | File | Purpose |
+|--------|------|---------|
+| Config | `src/config.rs` | Data rates, OFDM params, frame config |
+| QPSK | `src/physical/qpsk.rs` | Gray-coded QPSK map/demap |
+| Preamble | `src/physical/preamble.rs` | Preamble gen (seed=42), cross-correlation |
+| OFDM Mod | `src/physical/ofdm_mod.rs` | IFFT, CP, raised-cosine, normalization |
+| OFDM Demod | `src/physical/ofdm_demod.rs` | Timing, channel est, DD phase tracking |
+| Scrambler | `src/link/scrambler.rs` | ChaCha12 XOR (seed=12345) |
+| CRC | `src/link/crc.rs` | CRC-32 (Ethernet/ZIP polynomial) |
+| RS FEC | `src/link/fec.rs` | RS(255,223) encode/decode via `reed-solomon` crate |
+| Frame | `src/link/frame.rs` | FrameAssembler, FrameParser (sync + RS + CRC) |
+| Traits | `src/lib.rs` | Modulator, Demodulator traits |
 
-| Decision | Rationale |
-|----------|-----------|
-| No buffer pruning | Pruning caused 1-sample/frame drift → hundreds of samples across 277 frames → preamble miss |
-| `search_pos = abs_pos + frame_samples` | Fixed step matches frame boundaries exactly; avoids redundant scanning |
-| Per-frame preamble | PLL resets, independent frame detection, unlimited total duration |
-| No pilot subcarriers | DD tracking sufficient; pilots waste 4/60 SC (7%) |
-| Scrambler (seed=12345) | Prevents sync-pattern aliasing in DD phase tracking |
-| Preamble threshold 0.10 | Balances detection rate vs false positives; CRC catches false alarms |
+## Test Results (14 passing)
+
+```bash
+tests/fec_tests.rs ......... 5 passed
+tests/framing_tests.rs ..... 5 passed  
+tests/ofdm_roundtrip.rs .... 4 passed
+```
+
+## Current OFDM Parameters
+
+| Parameter | Value |
+|-----------|-------|
+| FFT size | 256 |
+| CP length | 32 |
+| Active subcarriers | 10-69 (60 total) |
+| Modulation | QPSK (2 bits/subcarrier) |
+| Preamble | 8 OFDM symbols (seed=42) |
+| Scrambler | ChaCha12 PRNG (seed=12345) |
+| Symbol duration | 288 samples (6 ms at 48 kHz) |
+| Data syms/frame | Variable (up to 35, computed from payload) |
+| Frame time | ~258 ms (8 preamble + 35 data at 166.7 Hz) |
+| Payload per frame | 442 B (2 RS blocks, CRC-32) |
+| Preamble threshold | 0.05 (normalized cross-correlation) |
 
 ## Next Steps
 
-1. ✅ **SC range expanded** 9-43 → 10-69 based on OTA frequency response measurement
-2. ✅ **Frame duration reduced** 60 → 35 data syms (384 ms → 258 ms, 33% shorter)
-3. ✅ **OTAs reliability characterized** 100% at 30 s with 8 preamble, binary frame loss pattern
-4. ✅ **Reduce preamble miss rate** — increased preamble 4→8 symbols, position tracking, lower threshold
-5. ✅ **On-the-fly TX generation** — avoid O(1 GB) audio buffer for 90-min Shrek
+1. **CLI crate**: cpal audio I/O for desktop TX/RX testing
+2. **WASM crate**: Leptos web app with AudioWorklet/ScriptProcessorNode
+3. **OTA validation**: Compare frame reception rate vs Python baseline (100% at 30s)
+4. **Signal quality test mode**: Preamble peak, CFO, per-SC channel estimate display
 
-## Relevant Files
+## Data Flow
 
-- `src/config.py` — Defaults: SC 10-69, CP=32, QPSK, no pilots, preamble=4, payload_size=442, nsym=32
-- `src/physical/ofdm.py` — Channel threshold 0.01, CFO clamp ±0.05, PLL β=0.08, leak=0.999, slope clip ±0.02. Per-frame PLL reset.
-- `examples/demo_rx.py` — Continuous RX, dynamic `frame_data_syms()`, signal handlers, no buffer pruning
-- `examples/demo_tx.py` — Per-frame preamble TX, polling wait for playback completion
-- `examples/demo_pipeline.py` — Convenience launcher: RX (+ optional ffplay) + TX
-- `examples/test_ota_demo.py` — Reproducible OTA test (97% at 30 s expected)
-- `src/link/framing.py` — FrameAssembler, FrameParser (sync, RS, CRC)
-- `src/link/fec.py` — ReedSolomonFec with configurable nsym
-- `src/audio/io.py` — AudioStream, split-duplex fallback
-- `/tmp/freq_response.json` — Mic |H| per SC 1-127, captured OTA
+```
+TX: Bytes → Scramble → Pack bits → QPSK map → OFDM syms (IFFT+CP) → Preamble → Audio
+
+RX: Audio → Cross-correlation → Preamble detect → Channel est → CFO est
+       → Per-sym FFT → DD phase correction → Equalization → QPSK demap
+       → Unpack bits → Descramble → Bytes
+```
