@@ -1,4 +1,4 @@
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Config {
     pub sample_rate: u32,
     pub fft_size: usize,
@@ -75,7 +75,119 @@ impl Config {
         self.sample_rate as f32 / self.symbol_duration_samples() as f32
     }
 
+    /// Preset: higher symbol rate (333 sym/s) via FFT=128, CP=16
+    pub fn high_baud() -> Self {
+        Self {
+            sample_rate: 48000,
+            fft_size: 128,
+            cp_length: 16,
+            sc_min: 4,
+            sc_max: 31,
+            preamble_symbols: 8,
+            data_symbols_per_frame: 35,
+            payload_size: 128,
+            output_amplitude: 0.08,
+            rs_nsym: 32,
+            preamble_threshold: 0.05,
+            cfo_clamp: 0.05,
+            pll_beta: 0.08,
+            pll_leak: 0.999,
+            dd_alpha: 0.3,
+            slope_alpha: 0.3,
+            slope_clip: 0.02,
+            scrambler_seed: 12345,
+            preamble_seed: 42,
+        }
+    }
+
+    /// Preset: robust narrowband (83 sym/s) via FFT=512, CP=64, wider SC range
+    pub fn robust() -> Self {
+        Self {
+            sample_rate: 48000,
+            fft_size: 512,
+            cp_length: 64,
+            sc_min: 20,
+            sc_max: 120,
+            preamble_symbols: 8,
+            data_symbols_per_frame: 15,
+            payload_size: 256,
+            output_amplitude: 0.10,
+            rs_nsym: 32,
+            preamble_threshold: 0.03,
+            cfo_clamp: 0.05,
+            pll_beta: 0.08,
+            pll_leak: 0.999,
+            dd_alpha: 0.3,
+            slope_alpha: 0.3,
+            slope_clip: 0.02,
+            scrambler_seed: 12345,
+            preamble_seed: 42,
+        }
+    }
+
+    /// Preset: ultrasonic range (15.0–22.5 kHz) via SC=80–120 on FFT=256
+    pub fn ultrasonic() -> Self {
+        Self {
+            sample_rate: 48000,
+            fft_size: 256,
+            cp_length: 32,
+            sc_min: 80,
+            sc_max: 120,
+            preamble_symbols: 8,
+            data_symbols_per_frame: 35,
+            payload_size: 256,
+            output_amplitude: 0.12,
+            rs_nsym: 32,
+            preamble_threshold: 0.05,
+            cfo_clamp: 0.05,
+            pll_beta: 0.08,
+            pll_leak: 0.999,
+            dd_alpha: 0.3,
+            slope_alpha: 0.3,
+            slope_clip: 0.02,
+            scrambler_seed: 12345,
+            preamble_seed: 42,
+        }
+    }
+
+    /// Preset: ultra-wide bandwidth (0.9–20.6 kHz, 176 sym/s, 37 kbps)
+    pub fn ultrawide() -> Self {
+        Self {
+            sample_rate: 48000,
+            fft_size: 256,
+            cp_length: 16,
+            sc_min: 5,
+            sc_max: 110,
+            preamble_symbols: 8,
+            data_symbols_per_frame: 35,
+            payload_size: 442,
+            output_amplitude: 0.06,
+            rs_nsym: 32,
+            preamble_threshold: 0.05,
+            cfo_clamp: 0.05,
+            pll_beta: 0.08,
+            pll_leak: 0.999,
+            dd_alpha: 0.3,
+            slope_alpha: 0.3,
+            slope_clip: 0.02,
+            scrambler_seed: 12345,
+            preamble_seed: 42,
+        }
+    }
+
     pub fn theoretical_bps(&self) -> f32 {
         self.bits_per_ofdm_symbol() as f32 * self.symbol_rate()
+    }
+
+    pub fn frequency_min(&self) -> f32 {
+        self.sc_min as f32 * self.sample_rate as f32 / self.fft_size as f32
+    }
+
+    pub fn frequency_max(&self) -> f32 {
+        self.sc_max as f32 * self.sample_rate as f32 / self.fft_size as f32
+    }
+
+    pub fn occupied_bandwidth(&self) -> f32 {
+        self.frequency_max() - self.frequency_min()
     }
 }

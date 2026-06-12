@@ -9,9 +9,7 @@ use wasm_bindgen::JsCast;
 
 const WORKLET_JS: &str = r#"
 class SoswRxProcessor extends AudioWorkletProcessor {
-    constructor() {
-        super();
-    }
+    constructor() { super(); }
     process(inputs, outputs, parameters) {
         const input = inputs[0];
         if (input && input[0] && input[0] instanceof Float32Array) {
@@ -57,9 +55,7 @@ impl RxHandle {
     }
 }
 
-pub async fn start_rx() -> Result<RxHandle, JsValue> {
-    let _config = Config::ofdm_default();
-
+pub async fn start_rx(config: &Config) -> Result<RxHandle, JsValue> {
     let ctx = web_sys::AudioContext::new()?;
 
     let window = web_sys::window().ok_or(JsValue::from_str("no window"))?;
@@ -76,7 +72,6 @@ pub async fn start_rx() -> Result<RxHandle, JsValue> {
 
     let source = ctx.create_media_stream_source(&stream)?;
 
-    // Inline AudioWorklet processor
     let parts = js_sys::Array::new();
     parts.push(&wasm_bindgen::JsValue::from_str(WORKLET_JS));
     let blob = web_sys::Blob::new_with_str_sequence(&parts)?;
@@ -121,7 +116,7 @@ pub async fn start_rx() -> Result<RxHandle, JsValue> {
 
     source.connect_with_audio_node(&worklet)?;
 
-    let demodulator = OfdmDemodulator::new(&_config);
+    let demodulator = OfdmDemodulator::new(config);
 
     Ok(RxHandle {
         demodulator,
@@ -157,26 +152,18 @@ pub fn play_audio(
     on_complete: impl FnMut() + 'static,
 ) -> Result<TxPlayback, JsValue> {
     let ctx = web_sys::AudioContext::new()?;
-
     let len = samples.len() as u32;
     let num_channels = 1u32;
-
     let audio_buffer = ctx.create_buffer(num_channels, len, sample_rate)?;
-
     audio_buffer.copy_to_channel(&samples, 0)?;
-
     let source = ctx.create_buffer_source()?;
     source.set_buffer(Some(&audio_buffer));
     source.connect_with_audio_node(&ctx.destination())?;
-
     let done = Closure::<dyn FnMut()>::new(on_complete);
     let callback = done.as_ref().unchecked_ref();
     source.add_event_listener_with_callback("ended", callback)?;
-
     source.start()?;
-
     let duration_ms = (len as f64) / (sample_rate as f64) * 1000.0;
-
     Ok(TxPlayback {
         _audio_ctx: ctx,
         _source: source,
@@ -185,8 +172,47 @@ pub fn play_audio(
     })
 }
 
-pub fn modulate_frame(data: &[u8]) -> Vec<f32> {
-    let config = Config::ofdm_default();
-    let mut modulator = OfdmModulator::new(&config);
+pub fn play_audio_looped(
+    samples: Vec<f32>,
+    sample_rate: f32,
+) -> Result<TxPlayback, JsValue> {
+    let ctx = web_sys::AudioContext::new()?;
+    let len = samples.len() as u32;
+    let num_channels = 1u32;
+    let audio_buffer = ctx.create_buffer(num_channels, len, sample_rate)?;
+    audio_buffer.copy_to_channel(&samples, 0)?;
+    let source = ctx.create_buffer_source()?;
+    source.set_buffer(Some(&audio_buffer));
+    source.set_loop(true);
+    source.connect_with_audio_node(&ctx.destination())?;
+    source.start()?;
+    let duration_ms = (len as f64) / (sample_rate as f64) * 1000.0;
+    // No on_complete for looped playback
+    Ok(TxPlayback {
+        _audio_ctx: ctx,
+        _source: source,
+        duration_ms,
+        _on_done: None,
+    })
+}
+
+pub fn modulate_frame(data: &[u8], config: &Config) -> Vec<f32> {
+    let mut modulator = OfdmModulator::new(config);
     modulator.modulate_with_preamble(data)
+}
+
+pub fn build_test_signal(config: &Config, n_frames: usize) -> Vec<f32> {
+    use sosw_core::link::frame::FrameAssembler;
+    let mut assembler = FrameAssembler::new(config);
+    let mut all_audio = Vec::new();
+    for _ in 0..n_frames {
+        let test_data: Vec<u8> = (0..config.payload_size)
+            .map(|i| (i % 256) as u8)
+            .collect();
+        let frame = assembler.assemble_frame(&test_data);
+        let mut modulator = OfdmModulator::new(config);
+        let samples = modulator.modulate_with_preamble(&frame);
+        all_audio.extend_from_slice(&samples);
+    }
+    all_audio
 }

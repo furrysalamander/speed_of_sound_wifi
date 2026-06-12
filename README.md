@@ -1,6 +1,27 @@
 # Speed of Sound WiFi
 
-Acoustically coupled data transmission program in Python. Transmits files over audio using M-FSK modulation with forward error correction, designed to push the limits of baud rate before link failure.
+Acoustically coupled data transmission over audio with OFDM modulation.  
+**Rust** (OFDM) and **Python** (legacy M-FSK) implementations.
+
+## Rust WASM Web App
+
+The `sosw-web` crate provides a browser-based OFDM modem with:
+
+- **RX tab** — real-time audio capture, preamble detection, waterfall spectrogram
+- **TX tab** — file upload and transmission via AudioBufferSourceNode
+- **Debug tab** — config tuning, enhanced signal monitoring, loopback testing
+  - 5 preset configs: Default, High Baud, Robust, Ultrasonic, Ultrawide
+  - Subcarrier range sliders, FFT/CP presets, threshold/PLL controls
+  - Per-subcarrier channel magnitude bar chart
+  - Continuous test signal generation for cross-device RX testing
+  - Config persistence via localStorage
+
+```bash
+cd sosw-web && trunk serve   # Dev server
+cd sosw-web && trunk build --release   # Production build
+```
+
+See `sosw-web/src/` for source files (`debug.rs`, `presets.rs`, `rx.rs`, `tx.rs`, `audio.rs`, `waterfall.rs`).
 
 ## Architecture
 

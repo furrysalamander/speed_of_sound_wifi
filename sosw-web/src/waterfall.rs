@@ -8,6 +8,12 @@ pub struct Waterfall {
     height: u32,
     buffer: Vec<u8>,
     col: u32,
+    // Active band overlay
+    band_sc_min: Option<usize>,
+    band_sc_max: Option<usize>,
+    band_fft_size: Option<usize>,
+    // Frequency axis labels
+    sample_rate: u32,
 }
 
 impl Waterfall {
@@ -28,7 +34,18 @@ impl Waterfall {
             height,
             buffer,
             col: 0,
+            band_sc_min: None,
+            band_sc_max: None,
+            band_fft_size: None,
+            sample_rate: 48000,
         })
+    }
+
+    pub fn set_active_band(&mut self, sc_min: usize, sc_max: usize, fft_size: usize, sample_rate: u32) {
+        self.band_sc_min = Some(sc_min);
+        self.band_sc_max = Some(sc_max);
+        self.band_fft_size = Some(fft_size);
+        self.sample_rate = sample_rate;
     }
 
     pub fn push_spectrum(&mut self, magnitudes: &[f32]) {
@@ -42,6 +59,19 @@ impl Waterfall {
         if self.col >= w as u32 {
             self.col = 0;
         }
+
+        // Compute the active band pixel range for overlay
+        let (band_x_start, band_x_end) = if let (Some(sc_min), Some(sc_max), Some(fft_size)) =
+            (self.band_sc_min, self.band_sc_max, self.band_fft_size)
+        {
+            let half_bins = fft_size / 2;
+            (
+                sc_min * w / half_bins,
+                (sc_max + 1) * w / half_bins,
+            )
+        } else {
+            (0, 0)
+        };
 
         for y in 0..h {
             let idx = y * magnitudes.len() / h;
@@ -59,15 +89,32 @@ impl Waterfall {
                 self.buffer[buf_idx + 2] = b;
                 self.buffer[buf_idx + 3] = 255;
             }
+
+            // Draw active band overlay on the current column
+            if band_x_end > band_x_start {
+                let col = self.col as usize;
+                if col >= band_x_start && col < band_x_end {
+                    // Tint the active band pixels - add a subtle green tint
+                    let alpha_factor = 0.3;
+                    let existing_r = r as f32;
+                    let existing_g = g as f32;
+                    let existing_b = b as f32;
+                    let tint_r = existing_r * (1.0 - alpha_factor) + 80.0 * alpha_factor;
+                    let tint_g = existing_g * (1.0 - alpha_factor) + 255.0 * alpha_factor;
+                    let tint_b = existing_b * (1.0 - alpha_factor) + 80.0 * alpha_factor;
+                    if buf_idx + 3 < self.buffer.len() {
+                        self.buffer[buf_idx] = tint_r as u8;
+                        self.buffer[buf_idx + 1] = tint_g as u8;
+                        self.buffer[buf_idx + 2] = tint_b as u8;
+                    }
+                }
+            }
         }
 
         self.col += 1;
     }
 
     pub fn render(&mut self) {
-        let _w = self.width as usize;
-        let _h = self.height as usize;
-
         let image_data = match ImageData::new_with_u8_clamped_array_and_sh(
             wasm_bindgen::Clamped(&self.buffer),
             self.width,
@@ -78,6 +125,33 @@ impl Waterfall {
         };
 
         let _ = self.ctx.put_image_data(&image_data, 0.0, 0.0);
+
+        // Draw frequency axis labels
+        if let Some(fft_size) = self.band_fft_size {
+            let fs = self.sample_rate as f64;
+            let w = self.width as f64;
+            let h = self.height as f64;
+            let _ = self.ctx.set_fill_style_str("#888");
+            let _ = self.ctx.set_font("10px monospace");
+
+            // Left label: 0 Hz
+            let _ = self.ctx.fill_text("0", 2.0, h - 4.0);
+
+            // Right label: sample_rate/2 Hz
+            let right_text = format!("{}k", (fs / 2000.0).round() as u32);
+            let _ = self.ctx.fill_text(&right_text, w - 40.0, h - 4.0);
+
+            // Active band labels
+            if let (Some(sc_min), Some(sc_max)) = (self.band_sc_min, self.band_sc_max) {
+                let bin_w = fs / fft_size as f64;
+                let f_min = sc_min as f64 * bin_w;
+                let f_max = sc_max as f64 * bin_w;
+                let band_label = format!("{:.0}k–{:.0}k", f_min / 1000.0, f_max / 1000.0);
+                let label_x = w - 100.0;
+                let _ = self.ctx.set_fill_style_str("#4fc3f7");
+                let _ = self.ctx.fill_text(&band_label, label_x, 12.0);
+            }
+        }
     }
 
     fn hot_colormap(&self, t: f32) -> (u8, u8, u8) {

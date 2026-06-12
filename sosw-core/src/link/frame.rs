@@ -101,7 +101,7 @@ impl FrameParser {
                         }
                         frames.push(frame);
                     } else {
-                        if self.buffer.len() > SYNC_PATTERN.len() + 4 {
+                        if self.buffer.len() >= self.min_frame_len() {
                             self.buffer.drain(0..1);
                         } else {
                             break;
@@ -119,6 +119,10 @@ impl FrameParser {
         }
 
         frames
+    }
+
+    fn min_frame_len(&self) -> usize {
+        SYNC_PATTERN.len() + 255 + 4
     }
 
     fn find_sync(&self) -> Option<usize> {
@@ -161,7 +165,10 @@ impl FrameParser {
             let fec_data = &self.buffer[sync_end..data_end];
 
             if crc::verify_crc32(crc_region, crc_bytes) {
-                let (decoded, _success) = self.fec.decode(fec_data);
+                let (decoded, success) = self.fec.decode(fec_data);
+                if !success {
+                    self.fec_fail += 1;
+                }
                 if decoded.len() >= 4 {
                     let frame_type = (decoded[0] >> 4) & 0x0F;
                     let payload_len =
@@ -179,10 +186,11 @@ impl FrameParser {
                         payload: actual_payload,
                         frame_type,
                         sequence_number: seq_num,
-                        valid: true,
+                        valid: success,
                     });
                 }
             } else {
+                self.crc_fail += 1;
                 let (decoded, success) = self.fec.decode(fec_data);
                 if decoded.len() >= 4 {
                     let reencoded = self.fec.encode(&decoded);
