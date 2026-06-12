@@ -82,22 +82,36 @@ impl OfdmModulator {
         let config = &self.config;
         let n_sc = config.active_subcarriers();
         let bits_per_sym = n_sc * 2;
+        let total_frame_bits = config.data_symbols_per_frame * bits_per_sym;
+
+        let data_bits = data.len() * 8;
+        let pad_bits = total_frame_bits.saturating_sub(data_bits);
+        let pad_full_bytes = pad_bits / 8;
+        let pad_remain_bits = pad_bits % 8;
 
         let scrambled = self.scrambler.scramble(data);
-        let total_bits = scrambled.len() * 8;
-        let padded_bits = ((total_bits + bits_per_sym - 1) / bits_per_sym) * bits_per_sym;
-        let mut bit_vec = Vec::with_capacity(padded_bits);
+        let pad_total = pad_full_bytes + if pad_remain_bits > 0 { 1 } else { 0 };
+        let mask_all = self.scrambler.mask(data.len() + pad_total);
+        let mut bit_vec = Vec::with_capacity(total_frame_bits);
         for &byte in &scrambled {
             for b in (0..8).rev() {
                 bit_vec.push((byte >> b) & 1);
             }
         }
-        while bit_vec.len() < padded_bits {
-            bit_vec.push(0);
+        if pad_total > 0 {
+            let pad_mask = &mask_all[data.len()..data.len() + pad_total];
+            for &byte in &pad_mask[..pad_full_bytes] {
+                for b in (0..8).rev() {
+                    bit_vec.push((byte >> b) & 1);
+                }
+            }
+            for b in (0..pad_remain_bits).rev() {
+                bit_vec.push((pad_mask[pad_full_bytes] >> b) & 1);
+            }
         }
 
         let mut audio = Vec::with_capacity(
-            config.preamble_samples() + (padded_bits / bits_per_sym) * config.symbol_duration_samples(),
+            config.preamble_samples() + config.data_symbols_per_frame * config.symbol_duration_samples(),
         );
 
         audio.extend_from_slice(&self.preamble_audio);

@@ -50,9 +50,7 @@ fn test_multi_frame_roundtrip() {
         all_payload.extend_from_slice(&frame_data);
     }
 
-    let bits_per_sym = config.active_subcarriers() * 2;
-    let data_syms_per_frame = (ps * 8 + bits_per_sym - 1) / bits_per_sym;
-    let frame_len = (config.preamble_symbols + data_syms_per_frame) * config.symbol_duration_samples();
+    let frame_len = config.frame_samples();
 
     let mut audio = Vec::new();
     for chunk in all_payload.chunks(ps) {

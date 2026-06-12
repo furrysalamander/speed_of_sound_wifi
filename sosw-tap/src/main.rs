@@ -11,13 +11,17 @@ use sosw_tap::tap::TapInterface;
 enum Cli {
     /// Start a sonic Ethernet node
     Serve {
-        /// TAP interface name
-        #[arg(long, default_value = "sosw0")]
-        tap: String,
+            /// TAP interface name
+            #[arg(long, default_value = "sosw0")]
+            tap: String,
 
-        /// Node ID (0-255); derived from MAC if not set
-        #[arg(long)]
-        node_id: Option<u8>,
+            /// PHY preset (default, high_baud, robust, ultrasonic, ultrawide)
+            #[arg(short = 'p', long, default_value = "default")]
+            preset: String,
+
+            /// Node ID (0-255); derived from MAC if not set
+            #[arg(long)]
+            node_id: Option<u8>,
 
         /// Explicit MAC address
         #[arg(long)]
@@ -68,6 +72,7 @@ fn main() -> Result<()> {
         Cli::ListDevices => list_devices(),
         Cli::Serve {
             tap,
+            preset,
             node_id,
             mac: _mac,
             tx_device,
@@ -80,6 +85,7 @@ fn main() -> Result<()> {
             ack_timeout,
         } => serve(
             &tap,
+            &preset,
             node_id,
             tx_device.as_deref(),
             rx_device.as_deref(),
@@ -110,6 +116,7 @@ fn list_devices() -> Result<()> {
 
 fn serve(
     tap_name: &str,
+    preset: &str,
     node_id: Option<u8>,
     tx_device: Option<&str>,
     rx_device: Option<&str>,
@@ -126,7 +133,7 @@ fn serve(
     log::info!("TAP interface: {}", tap.name_string());
     log::info!("Node ID: {}", id);
 
-    let cfg = Config::ofdm_default();
+    let cfg = Config::from_preset_name(preset);
     let phy = Phy::new(cfg.clone(), tx_device, rx_device)?;
     log::info!("PHY initialized (48 kHz, {} Hz symbol rate)", cfg.symbol_rate() as u32);
 

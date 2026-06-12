@@ -5,6 +5,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use sosw_core::config::Config;
 use sosw_core::physical::ofdm_demod::OfdmDemodulator;
 use sosw_core::physical::ofdm_mod::OfdmModulator;
+use sosw_core::physical::preamble;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -20,12 +21,17 @@ struct Args {
     frames: usize,
     #[arg(long, default_value_t = -1.0)]
     snr_db: f32,
+    #[arg(short = 'p', long, default_value = "default")]
+    preset: String,
+    #[arg(long, default_value_t = 1.0)]
+    gain: f32,
 }
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    let config = Config::ofdm_default();
+    let config = Config::from_preset_name(&args.preset);
     let payload_size = config.payload_size;
+    let tx_gain = args.gain;
     let n_frames = args.frames;
 
     eprintln!("=== OTA Validation ===");
@@ -38,15 +44,35 @@ fn main() -> anyhow::Result<()> {
         .collect();
 
     let mut modulator = OfdmModulator::new(&config);
+    let guard = config.symbol_duration_samples();
+    let conv_frames = 3; // training frames for consumed_samples to converge
+    let mut total_frames = n_frames + conv_frames;
     let mut audio = Vec::new();
+    // 0.5s silence before first frame for capture alignment
+    audio.extend(std::iter::repeat(0.0f32).take((config.sample_rate as f64 * 0.5) as usize));
+    // training frames for convergence (consumed_samples stride needs 2-3 frames)
+    for i in 0..conv_frames {
+        let train = vec![(i % 256) as u8; payload_size];
+        audio.extend_from_slice(&modulator.modulate_with_preamble(&train));
+        audio.extend(std::iter::repeat(0.0f32).take(guard));
+    }
     for chunk in payload.chunks(payload_size) {
         let frame_audio = modulator.modulate_with_preamble(chunk);
         audio.extend_from_slice(&frame_audio);
+        audio.extend(std::iter::repeat(0.0f32).take(guard));
     }
-    eprintln!("  Audio: {:.1}s ({} samples)", audio.len() as f64 / config.sample_rate as f64, audio.len());
+    if tx_gain != 1.0 {
+        for s in audio.iter_mut() {
+            *s *= tx_gain;
+        }
+    }
+    let tx_rms = (audio.iter().map(|&s| s * s).sum::<f32>() / audio.len() as f32).sqrt();
+    let tx_max = audio.iter().map(|&s| s.abs()).fold(0.0f32, f32::max);
+    eprintln!("  Audio: {:.1}s ({} samples, {} data+{}train frames, max={:.4} RMS={:.6}, gain={}x)",
+              audio.len() as f64 / config.sample_rate as f64, audio.len(), n_frames, conv_frames, tx_max, tx_rms, tx_gain);
 
     let received = if args.snr_db < 0.0 {
-        ota_loopback(&config, &audio, &args.tx_device, &args.rx_device, n_frames)?
+        ota_loopback(&config, &audio, &args.tx_device, &args.rx_device, n_frames + conv_frames)?
     } else {
         software_loopback(&config, &audio, args.snr_db)?
     };
@@ -56,14 +82,15 @@ fn main() -> anyhow::Result<()> {
 
     eprintln!("\n=== Analysis ===");
 
-    // Raw byte comparison
+    // Raw byte comparison (skip conv_frames training frames in received buffer)
     let mut matching_frames = 0usize;
     let mut total_diff_bytes = 0usize;
     for i in 0..n_frames.min(input_frames) {
         let start = i * payload_size;
+        let rx_start = (conv_frames + i) * payload_size;
         let sent = &payload[start..start + payload_size];
-        let recv_raw = if start + payload_size <= received.len() {
-            &received[start..start + payload_size]
+        let recv_raw = if rx_start + payload_size <= received.len() {
+            &received[rx_start..rx_start + payload_size]
         } else {
             &[]
         };
@@ -78,16 +105,16 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    // RS(255,223) with nsym=32 corrects up to 16 byte errors per 255-byte block.
-    // Each frame has 2 RS blocks. If the average error per block < 16, RS corrects all.
-    // Effective frame match = frames where errors_per_block <= 16
-    let rs_byte_budget = (payload_size / 223 + 1) * 16; // max correctable bytes per frame
+    // RS(255,223) corrects up to nsym/2 byte errors per 255-byte block.
+    // Effective frame match = frames where total byte errors <= budget.
+    let rs_byte_budget = (payload_size / 223 + 1) * (config.rs_nsym / 2); // max correctable bytes per frame
     let rs_matched = (0..n_frames.min(input_frames))
         .filter(|&i| {
             let start = i * payload_size;
+            let rx_start = (conv_frames + i) * payload_size;
             let sent = &payload[start..start + payload_size];
-            let recv_raw = if start + payload_size <= received.len() {
-                &received[start..start + payload_size]
+            let recv_raw = if rx_start + payload_size <= received.len() {
+                &received[rx_start..rx_start + payload_size]
             } else {
                 &[]
             };
@@ -98,7 +125,23 @@ fn main() -> anyhow::Result<()> {
         })
         .count();
 
-    let raw_pct = matching_frames as f64 / n_frames as f64 * 100.0;
+        // Debug: print per-frame error counts for all frames
+        for i in 0..n_frames.min(input_frames) {
+            let start = i * payload_size;
+            let rx_start = (conv_frames + i) * payload_size;
+            let sent = &payload[start..start + payload_size];
+            let recv_raw = if rx_start + payload_size <= received.len() {
+                &received[rx_start..rx_start + payload_size]
+            } else {
+                &[]
+            };
+            if recv_raw != sent {
+                let diff = sent.iter().zip(recv_raw.iter()).filter(|(a, b)| a != b).count();
+                eprintln!("  Frame {} errors: {} / {}", i, diff, payload_size);
+            }
+        }
+
+        let raw_pct = matching_frames as f64 / n_frames as f64 * 100.0;
     let rs_pct = rs_matched as f64 / n_frames as f64 * 100.0;
     let avg_err = if n_frames > 0 { total_diff_bytes as f64 / n_frames as f64 } else { 0.0 };
     eprintln!("  Raw frames: {}/{} = {:.1}% (avg {:.1} byte errors/frame)", matching_frames, n_frames, raw_pct, avg_err);
@@ -205,19 +248,12 @@ fn ota_loopback(
     eprintln!("  RX device: {} (detected)", rx_name);
     eprintln!("  Ensure speaker is audible to the microphone!");
 
-    let max_tx = audio.iter().map(|&s| s.abs()).fold(0.0f32, f32::max);
-    let target_amp = 0.08;
-    let tx_scale = if max_tx > 0.0 { (target_amp / max_tx).min(1.0) } else { 1.0 };
-    let scaled_audio: Vec<f32> = if tx_scale < 1.0 {
-        audio.iter().map(|&s| s * tx_scale).collect()
-    } else {
-        audio.to_vec()
-    };
-    let audio_arc = Arc::new(scaled_audio);
+    let audio_arc = Arc::new(audio.to_vec());
 
     let tx_offset = Arc::new(AtomicUsize::new(0));
     let tx_done = Arc::new(AtomicBool::new(false));
 
+    let tx_is_stereo = tx_config.channels >= 2;
     let tx_stream: cpal::Stream = {
         let off = tx_offset.clone();
         let dn = tx_done.clone();
@@ -226,11 +262,24 @@ fn ota_loopback(
             tx_config,
             move |data: &mut [f32], _info: &cpal::OutputCallbackInfo| {
                 let o = off.load(Ordering::SeqCst);
-                for (i, s) in data.iter_mut().enumerate() {
-                    *s = a.get(o + i).copied().unwrap_or(0.0);
-                }
-                off.store(o + data.len(), Ordering::SeqCst);
-                if o + data.len() >= a.len() { dn.store(true, Ordering::SeqCst); }
+                let consumed = if tx_is_stereo {
+                    let frames = data.len() / 2;
+                    for i in 0..frames {
+                        let s = a.get(o + i).copied().unwrap_or(0.0);
+                        data[i * 2] = s;
+                        data[i * 2 + 1] = s;
+                    }
+                    frames
+                } else {
+                    let n = data.len().min(a.len().saturating_sub(o));
+                    for (i, s) in data[..n].iter_mut().enumerate() {
+                        *s = a.get(o + i).copied().unwrap_or(0.0);
+                    }
+                    n
+                };
+                let new_off = o + consumed;
+                off.store(new_off, Ordering::SeqCst);
+                if new_off >= a.len() { dn.store(true, Ordering::SeqCst); }
             },
             |err| eprintln!("TX error: {}", err),
             None,
@@ -280,38 +329,36 @@ fn ota_loopback(
         anyhow::bail!("Too little audio captured ({} samples, need >{})", captured.len(), config.preamble_samples());
     }
 
-    // Demodulate
+    // Demodulate (skip ~0.5s lead-in silence)
     let mut demod = OfdmDemodulator::new(config);
     let mut received_frames = Vec::new();
-    let mut search_pos = 0usize;
+    let lead_in = (config.sample_rate as f64 * 0.5) as usize;
+    let guard = config.symbol_duration_samples();
 
-    let bits_per_sym = config.active_subcarriers() * 2;
-    let data_syms = (config.payload_size * 8 + bits_per_sym - 1) / bits_per_sym;
-    let frame_len = (config.preamble_symbols + data_syms) * config.symbol_duration_samples();
-    let chunk_stride = frame_len;
-    let chunk_size = frame_len + config.preamble_samples() * 2;
+    // No preamble scan — start at lead_in. consumed_samples stride converges
+    // the preamble offset to ~guard after the first frame.
 
-    while search_pos < captured.len() {
-        if received_frames.len() / config.payload_size >= n_frames {
-            break;
-        }
+    // Use 6× guard for chunk margin so the initial preamble offset (~576 samples
+    // of audio latency) doesn't truncate data symbols. consumed_samples stride
+    // converges the offset to ~guard after 1-2 frames.
+    let chunk_size = config.frame_samples() + guard * 6;
+    let mut search_pos = lead_in;
+
+    while search_pos + config.preamble_samples() < captured.len() && received_frames.len() / config.payload_size < n_frames {
         let chunk_end = std::cmp::min(search_pos + chunk_size, captured.len());
-        if chunk_end - search_pos < config.preamble_samples() + config.symbol_duration_samples() {
-            break;
-        }
         let mut padded: Vec<f32> = captured[search_pos..chunk_end].to_vec();
         padded.extend(std::iter::repeat(0.0f32).take(config.symbol_duration_samples() * 4));
 
         if let Some(result) = demod.process_samples(&padded) {
             let n = result.bytes.len().min(config.payload_size);
+            let idx = received_frames.len() / config.payload_size;
             eprintln!("  [ota] Frame {}: peak={:.4} cfo={:.4} |H|={:.6} bytes={}",
-                      received_frames.len() / config.payload_size,
-                      result.preamble_peak, result.cfo_rad_per_sym,
+                      idx, result.preamble_peak, result.cfo_rad_per_sym,
                       result.mean_h_magnitude, result.bytes.len());
             received_frames.extend_from_slice(&result.bytes[..n]);
-            search_pos += frame_len;
+            search_pos += result.consumed_samples;
         } else {
-            search_pos += chunk_stride / 4;
+            search_pos += config.symbol_duration_samples();
         }
         demod.reset();
     }
@@ -338,11 +385,11 @@ fn software_loopback(config: &Config, audio: &[f32], snr_db: f32) -> anyhow::Res
     let mut demod = OfdmDemodulator::new(config);
     let mut received = Vec::new();
 
-    let bits_per_sym = config.active_subcarriers() * 2;
-    let data_syms = (config.payload_size * 8 + bits_per_sym - 1) / bits_per_sym;
-    let frame_len = (config.preamble_symbols + data_syms) * config.symbol_duration_samples();
+    // skip initial silence, stride by full padded frame length
+    let lead_in = (config.sample_rate as f64 * 0.5) as usize;
+    let frame_len = config.frame_samples();
 
-    for chunk_start in (0..noisy.len()).step_by(frame_len) {
+    for chunk_start in (lead_in..noisy.len()).step_by(frame_len) {
         if chunk_start + config.preamble_samples() > noisy.len() {
             break;
         }

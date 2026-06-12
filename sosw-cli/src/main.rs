@@ -16,12 +16,16 @@ enum Commands {
     ListDevices,
     Tx {
         file: PathBuf,
+        #[arg(short = 'p', long, default_value = "default")]
+        preset: String,
         #[arg(short = 'd', long)]
         device: Option<String>,
     },
     Rx {
         #[arg(short = 'n', long, default_value = "100")]
         count: usize,
+        #[arg(short = 'p', long, default_value = "default")]
+        preset: String,
         #[arg(short = 'd', long)]
         device: Option<String>,
         #[arg(short = 'o', long)]
@@ -30,6 +34,8 @@ enum Commands {
     Test {
         #[arg(short = 't', long, default_value = "10")]
         duration: f64,
+        #[arg(short = 'p', long, default_value = "default")]
+        preset: String,
         #[arg(short = 'd', long)]
         device: Option<String>,
     },
@@ -37,13 +43,21 @@ enum Commands {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let config = Config::ofdm_default();
 
-    match cli.command {
+    match &cli.command {
         Commands::ListDevices => list_devices(),
-        Commands::Tx { file, device } => tx_mode(&config, &file, device.as_deref()),
-        Commands::Rx { count, device, output } => rx_mode(&config, count, device.as_deref(), output.as_ref()),
-        Commands::Test { duration, device } => test_mode(&config, duration, device.as_deref()),
+        Commands::Tx { file, preset, device } => {
+            let config = Config::from_preset_name(preset);
+            tx_mode(&config, file, device.as_deref())
+        }
+        Commands::Rx { count, preset, device, output } => {
+            let config = Config::from_preset_name(preset);
+            rx_mode(&config, *count, device.as_deref(), output.as_ref())
+        }
+        Commands::Test { duration, preset, device } => {
+            let config = Config::from_preset_name(preset);
+            test_mode(&config, *duration, device.as_deref())
+        }
     }
 }
 

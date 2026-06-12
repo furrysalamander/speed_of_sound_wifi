@@ -84,10 +84,10 @@ impl Config {
             sc_min: 4,
             sc_max: 31,
             preamble_symbols: 8,
-            data_symbols_per_frame: 35,
+            data_symbols_per_frame: 39,
             payload_size: 128,
             output_amplitude: 0.08,
-            rs_nsym: 32,
+            rs_nsym: 48,
             preamble_threshold: 0.05,
             cfo_clamp: 0.05,
             pll_beta: 0.08,
@@ -109,7 +109,7 @@ impl Config {
             sc_min: 20,
             sc_max: 120,
             preamble_symbols: 8,
-            data_symbols_per_frame: 15,
+            data_symbols_per_frame: 21,
             payload_size: 256,
             output_amplitude: 0.10,
             rs_nsym: 32,
@@ -134,7 +134,7 @@ impl Config {
             sc_min: 80,
             sc_max: 120,
             preamble_symbols: 8,
-            data_symbols_per_frame: 35,
+            data_symbols_per_frame: 51,
             payload_size: 256,
             output_amplitude: 0.12,
             rs_nsym: 32,
@@ -159,7 +159,7 @@ impl Config {
             sc_min: 5,
             sc_max: 110,
             preamble_symbols: 8,
-            data_symbols_per_frame: 35,
+            data_symbols_per_frame: 20,
             payload_size: 442,
             output_amplitude: 0.06,
             rs_nsym: 32,
@@ -189,5 +189,15 @@ impl Config {
 
     pub fn occupied_bandwidth(&self) -> f32 {
         self.frequency_max() - self.frequency_min()
+    }
+
+    pub fn from_preset_name(name: &str) -> Self {
+        match name.to_lowercase().as_str() {
+            "high_baud" | "highbaud" => Self::high_baud(),
+            "robust" => Self::robust(),
+            "ultrasonic" => Self::ultrasonic(),
+            "ultrawide" => Self::ultrawide(),
+            _ => Self::ofdm_default(),
+        }
     }
 }

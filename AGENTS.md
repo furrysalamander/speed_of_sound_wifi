@@ -69,15 +69,17 @@ Total: 66 tests
 
 ## Config Presets
 
-| Preset | FFT | CP | SC Range | Freq Range | Sym Rate | Bitrate |
-|--------|-----|----|----------|------------|----------|---------|
-| Default | 256 | 32 | 10–69 | 1.9–12.9 kHz | 167 Hz | 20 kbps |
-| High Baud | 128 | 16 | 4–31 | 1.5–11.6 kHz | 333 Hz | 18.7 kbps |
-| Robust | 512 | 64 | 20–120 | 1.9–11.3 kHz | 83 Hz | 16.8 kbps |
-| Ultrasonic | 256 | 32 | 80–120 | 15.0–22.5 kHz | 167 Hz | 13.7 kbps |
-| Ultrawide | 256 | 16 | 5–110 | 0.9–20.6 kHz | 176 Hz | 37.4 kbps |
+`data_symbols_per_frame` is matched to full FrameAssembler output (sync + RS-FEC + CRC, exact fit).
 
-All presets verified by software roundtrip test (`param_sweep.rs`).
+| Preset | FFT | CP | SC Range | Freq Range | Sym/s | Syms/Frame | Frame Dur | Bitrate |
+|--------|-----|----|----------|------------|-------|------------|-----------|---------|
+| Default | 256 | 32 | 10–69 | 1.9–12.9 kHz | 167 | 35 | 258 ms | 20 kbps |
+| High Baud | 128 | 16 | 4–31 | 1.5–11.6 kHz | 333 | 39 | 141 ms | 18.7 kbps |
+| Robust | 512 | 64 | 20–120 | 1.9–11.3 kHz | 83 | 21 | 348 ms | 16.8 kbps |
+| Ultrasonic | 256 | 32 | 80–120 | 15.0–22.5 kHz | 167 | 51 | 354 ms | 13.7 kbps |
+| Ultrawide | 256 | 16 | 5–110 | 0.9–20.6 kHz | 176 | 20 | 159 ms | 37.4 kbps |
+
+All presets verified by software roundtrip test (`param_sweep.rs`) and OTA validation (`ota-validate`).
 
 ## Debug Tab Features
 
@@ -87,30 +89,46 @@ All presets verified by software roundtrip test (`param_sweep.rs`).
 - **Config persistence**: Settings saved to localStorage automatically
 - **FrameParser integration**: CRC and FEC validation on received frames
 
-## Frequency Response (Measured OTA)
+## OTA Validation (Rust)
 
-Tested with ALC1220 analog speaker output → USB PnP Audio Device mic.
+Tested with ALC1220 analog speaker output → USB PnP Audio Device mic (loopback, frames separated by `sym_dur` silence). 30 frames per preset, `consumed_samples` stride for alignment convergence.
 
-| Band | Freq Range | Valid % | Peak |
-|------|-----------|---------|------|
-| 188–5,812 Hz | SC 1-31 | **0%** | 0.80 (ambient noise below 2 kHz) |
-| 1.9–7.5 kHz | SC 10-40 | 50% | 0.93 |
-| 5.6–11.3 kHz | SC 30-60 | 60% | 0.93 |
-| 9.4–15.0 kHz | SC 50-80 | 40% | 0.93 |
-| 13.1–18.8 kHz | SC 70-100 | 40% | 0.79 |
-| 16.9–22.5 kHz | SC 90-120 | **20%** | 0.81 |
+| Preset | SC Range | RS-Correctable | Notes |
+|--------|----------|---------------|-------|
+| Default | 10–69 | **100%** | 30/30, <13 err/frame |
+| High Baud | 4–31 | **100%** | 30/30, <8 err/frame |
+| Robust | 20–120 | **100%** | 30/30, <10 err/frame |
+| Ultrasonic | 80–120 | **100%** | 30/30, <6 err/frame |
+| Ultrawide | 5–110 | **100%** | 30/30, <18 err/frame |
 
-**Best presets OTA:** `ultrawide` (90% valid) and `robust` (80% valid). Ultrasonic preset works at 20% on this hardware — expect better with phone speakers or ultrasonic transducers.
+All 5 presets verified with OTA loopback — **100% RS-correctable** on 30-frame runs.
 
-All bands have preamble peaks >0.70, confirming the USB PnP mic responds up to at least 22.5 kHz. Frame loss is from bit errors in data symbols, not preamble detection failure. The key weak spot is **below 2 kHz** (ambient noise) and **above 15 kHz** (increasing symbol error rate).
+### Key Fixes
 
-Run your own sweep: `python -m examples.ota_freq_sweep --frames 10`
+- **Mask-padding**: Zero-bit padding caused all active subcarriers at (+1,+1), producing massive IFFT peaks that crushed normalization gain; replaced with scrambler-mask padding for normal PAPR
+- **Guard interval**: `sym_dur` silence between frames prevents cross-correlation false peaks from previous frame's random tail data
+- **`consumed_samples` stride**: Converges preamble offset to ~`guard` samples after 3 training frames, matching actual audio spacing with zero drift
+- **Training frames**: 3 dummy frames before data allow `consumed_samples` stride to converge (coarse energy search triggers on lead-in ambient noise, causing false preamble offset on frame 0)
+- **`data_symbols_per_frame`**: Exact-fit to FrameAssembler output for all presets (was over/under-provisioned for 4 of 5 presets)
+- **RS budget**: Correctly uses `rs_nsym/2` instead of hardcoded 16 per block
+- **Chunk margin**: `frame_samples + 6×guard` ensures first frame's preamble offset (~576 sample audio latency) doesn't truncate data symbols
+
+Run your own sweep: `cargo run --release -p sosw-cli --bin ota-validate -- --preset <name> --frames 20 --tx-device <tx> --rx-device <rx>`
+
+### OTA Throughput Analysis
+
+| Preset | PHY Rate | Frame Size | Frame Dur | Ethernet Goodput (est.) |
+|--------|----------|------------|-----------|------------------------|
+| Ultrawide | 37.4 kbps | 442 B | 159 ms | ~2 kbps |
+| High Baud | 18.7 kbps | 128 B | 141 ms | ~2 kbps |
+
+MAC timings (300 ms DIFS, 60 ms slots, 700 ms ACK timeout) are the real bottleneck, not PHY capacity.
 
 ## Next Steps
 
 1. ~~**CLI crate**: cpal audio I/O for desktop TX/RX testing~~ (done)
 2. ~~**WASM crate**: Leptos web app with AudioWorklet~~ (done: RX, TX, Debug tabs)
-3. **OTA validation**: Compare frame reception rate vs Python baseline (100% at 30s)
+3. ~~**OTA validation**: Rust OTA matches Python baseline; all 5 presets verified~~ (done)
 4. **sosw-tap**: Ethernet-over-sound with CSMA/CA MAC
 5. **WASM cross-device testing**: Validate ultrasonic presets with high-frequency hardware
 
