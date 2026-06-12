@@ -27,7 +27,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="OTA demo: TX -> [air] -> RX -> ffplay")
     parser.add_argument("--input", default=DEFAULT_INPUT,
-                        help="Input payload file (auto-generates 30s if missing)")
+                        help="Input payload file (auto-generates full Shrek if missing)")
     parser.add_argument("--tx-device", default="analog-stereo",
                         help="Output (TX) device name")
     parser.add_argument("--rx-device", default="USB_PnP",
@@ -40,6 +40,7 @@ def main():
 
     # --- prepare payload ---
     input_path = args.input
+    n = 0
     if not os.path.exists(input_path):
         print(f"Generating test clip: {input_path}", flush=True)
         shrek_source = os.path.normpath(os.path.join(
@@ -48,13 +49,14 @@ def main():
         if os.path.exists(shrek_source):
             c = Config()
             ps = c.frame.payload_size
-            n = 68
             with open(shrek_source, "rb") as src:
-                data = src.read(n * ps)
-                data += b"\x00" * (n * ps - len(data))
+                data = src.read()
+            extra = (ps - len(data) % ps) % ps
+            data += b"\x00" * extra
             with open(input_path, "wb") as f:
                 f.write(data)
-            print(f"  {n} frames from {shrek_source}", flush=True)
+            n = len(data) // ps
+            print(f"  {n} frames ({n * ps:,} B) from {shrek_source}", flush=True)
         else:
             print("  Shrek source not found — using random test data", flush=True)
             c = Config()
@@ -62,6 +64,9 @@ def main():
             n = 68
             with open(input_path, "wb") as f:
                 f.write(bytes(i % 256 for i in range(n * ps)))
+    else:
+        ps = Config().frame.payload_size
+        n = (os.path.getsize(input_path) + ps - 1) // ps
 
     # --- start receiver ---
     rx_proc = subprocess.Popen(
@@ -73,7 +78,8 @@ def main():
     time.sleep(1.0)
 
     # --- start transmitter ---
-    print(f"TX: {input_path} ({args.tx_device})", flush=True)
+    tx_dur = n * 0.258 + 10
+    print(f"TX: {input_path} ({args.tx_device}) — {n} frames, ~{tx_dur:.0f}s", flush=True)
     tx_proc = subprocess.Popen(
         [sys.executable, "-m", "examples.demo_tx",
          "--input", input_path,
