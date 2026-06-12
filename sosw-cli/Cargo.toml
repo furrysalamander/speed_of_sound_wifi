@@ -6,3 +6,6 @@ edition = "2021"
 [dependencies]
 sosw-core = { path = "../sosw-core" }
 clap = { version = "4", features = ["derive"] }
+cpal = "0.15"
+anyhow = "1"
+log = "0.4"
