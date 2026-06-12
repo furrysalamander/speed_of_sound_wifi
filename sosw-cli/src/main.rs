@@ -13,34 +13,23 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// List available audio devices
     ListDevices,
-    /// Transmit a file over OFDM audio
     Tx {
-        /// Input file to transmit
         file: PathBuf,
-        /// Output audio device name (substring match)
         #[arg(short = 'd', long)]
         device: Option<String>,
     },
-    /// Receive and decode OFDM audio
     Rx {
-        /// Number of frames to receive
         #[arg(short = 'n', long, default_value = "100")]
         count: usize,
-        /// Input audio device name (substring match)
         #[arg(short = 'd', long)]
         device: Option<String>,
-        /// Output file for received data (default: stdout)
         #[arg(short = 'o', long)]
         output: Option<PathBuf>,
     },
-    /// Test mode: show signal quality and frame stats
     Test {
-        /// Duration in seconds
         #[arg(short = 't', long, default_value = "10")]
         duration: f64,
-        /// Input audio device name (substring match)
         #[arg(short = 'd', long)]
         device: Option<String>,
     },
@@ -58,22 +47,29 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
+fn device_label(d: &cpal::Device) -> String {
+    match d.id() {
+        Ok(id) => format!("{}", id),
+        Err(_) => "?".to_string(),
+    }
+}
+
 fn list_devices() -> anyhow::Result<()> {
     let host = cpal::default_host();
     println!("Host: {}", host.id().name());
 
     println!("\nInput devices:");
     for device in host.input_devices()? {
-        let name = device.name()?;
         let config = device.default_input_config()?;
-        println!("  {} ({} Hz, {} channels, {:?})", name, config.sample_rate().0, config.channels(), config.sample_format());
+        println!("  {} ({} Hz, {} channels, {:?})", device_label(&device),
+                 config.sample_rate(), config.channels(), config.sample_format());
     }
 
     println!("\nOutput devices:");
     for device in host.output_devices()? {
-        let name = device.name()?;
         let config = device.default_output_config()?;
-        println!("  {} ({} Hz, {} channels, {:?})", name, config.sample_rate().0, config.channels(), config.sample_format());
+        println!("  {} ({} Hz, {} channels, {:?})", device_label(&device),
+                 config.sample_rate(), config.channels(), config.sample_format());
     }
     Ok(())
 }
@@ -86,10 +82,13 @@ fn find_device(name_substring: &str, kind: &str) -> anyhow::Result<cpal::Device>
         _ => anyhow::bail!("unknown device kind: {}", kind),
     };
 
+    let lower = name_substring.to_lowercase();
     for device in devices {
-        let name = device.name()?;
-        if name.to_lowercase().contains(&name_substring.to_lowercase()) {
-            return Ok(device);
+        if let Ok(id) = device.id() {
+            let id_str = format!("{}", id);
+            if id_str.to_lowercase().contains(&lower) {
+                return Ok(device);
+            }
         }
     }
     anyhow::bail!("no {} device matching '{}' found", kind, name_substring)
@@ -111,21 +110,21 @@ fn tx_mode(config: &Config, file: &PathBuf, device_name: Option<&str>) -> anyhow
         Some(name) => find_device(name, "output")?,
         None => default_output_device()?,
     };
-    eprintln!("TX: {} bytes from {}, device: {}", data.len(), file.display(), device.name()?);
+    eprintln!("TX: {} bytes from {}, device: {}", data.len(), file.display(), device_label(&device));
 
     let mut modulator = sosw_core::OfdmModulator::new(config);
     let audio = modulator.modulate_with_preamble(&data);
     let audio_len = audio.len();
-
     let sample_rate = config.sample_rate;
+
     let config_out = cpal::StreamConfig {
         channels: 1,
-        sample_rate: cpal::SampleRate(sample_rate),
+        sample_rate,
         buffer_size: cpal::BufferSize::Default,
     };
 
     let stream = device.build_output_stream(
-        &config_out,
+        config_out,
         move |data_out: &mut [f32], _info: &cpal::OutputCallbackInfo| {
             for (i, sample) in data_out.iter_mut().enumerate() {
                 *sample = *audio.get(i).unwrap_or(&0.0);
@@ -147,9 +146,8 @@ fn rx_mode(config: &Config, count: usize, device_name: Option<&str>, output: Opt
         Some(name) => find_device(name, "input")?,
         None => default_input_device()?,
     };
-    eprintln!("RX device: {}", device.name()?);
+    eprintln!("RX device: {}", device_label(&device));
 
-    let channels = 1usize;
     let sample_rate = config.sample_rate;
     let frames_per_buffer = config.symbol_duration_samples();
 
@@ -157,13 +155,13 @@ fn rx_mode(config: &Config, count: usize, device_name: Option<&str>, output: Opt
     let buf_clone = buf.clone();
 
     let config_in = cpal::StreamConfig {
-        channels: channels as u16,
-        sample_rate: cpal::SampleRate(sample_rate),
+        channels: 1,
+        sample_rate,
         buffer_size: cpal::BufferSize::Fixed(frames_per_buffer as u32),
     };
 
     let stream = device.build_input_stream(
-        &config_in,
+        config_in,
         move |data: &[f32], _info: &cpal::InputCallbackInfo| {
             let mut b = buf_clone.lock().unwrap();
             b.extend_from_slice(data);
@@ -188,7 +186,7 @@ fn rx_mode(config: &Config, count: usize, device_name: Option<&str>, output: Opt
                 std::thread::sleep(std::time::Duration::from_millis(50));
                 continue;
             }
-            let chunk: Vec<f32> = b.drain(..len / 2).collect(); // keep 50% overlap
+            let chunk: Vec<f32> = b.drain(..len / 2).collect();
             chunk
         };
 
@@ -202,7 +200,7 @@ fn rx_mode(config: &Config, count: usize, device_name: Option<&str>, output: Opt
     eprintln!();
 
     drop(stream);
-    
+
     match output {
         Some(path) => std::fs::write(path, &received)?,
         None => std::io::stdout().write_all(&received)?,
@@ -217,9 +215,8 @@ fn test_mode(config: &Config, duration_secs: f64, device_name: Option<&str>) -> 
         Some(name) => find_device(name, "input")?,
         None => default_input_device()?,
     };
-    eprintln!("Test mode on device: {} for {:.1}s", device.name()?, duration_secs);
+    eprintln!("Test mode on device: {} for {:.1}s", device_label(&device), duration_secs);
 
-    let channels = 1usize;
     let sample_rate = config.sample_rate;
     let frames_per_buffer = config.symbol_duration_samples();
 
@@ -227,13 +224,13 @@ fn test_mode(config: &Config, duration_secs: f64, device_name: Option<&str>) -> 
     let buf_clone = buf.clone();
 
     let config_in = cpal::StreamConfig {
-        channels: channels as u16,
-        sample_rate: cpal::SampleRate(sample_rate),
+        channels: 1,
+        sample_rate,
         buffer_size: cpal::BufferSize::Fixed(frames_per_buffer as u32),
     };
 
     let stream = device.build_input_stream(
-        &config_in,
+        config_in,
         move |data: &[f32], _info: &cpal::InputCallbackInfo| {
             let mut b = buf_clone.lock().unwrap();
             b.extend_from_slice(data);
