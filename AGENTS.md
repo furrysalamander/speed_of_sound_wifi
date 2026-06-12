@@ -26,11 +26,11 @@ alsa_input.usb-0c76_USB_PnP_Audio-01.mono    (input, "USB_PnP")
 | CP length | 32 | 0.67 ms guard interval (sufficient for 30 cm desk path) |
 | Active subcarriers | 10-69 (60 total) | 1875-12938 Hz (avoids USB mic dip at 1200-1500 Hz) |
 | Subcarrier modulation | QPSK (2 bits) | Gray-coded, 120 bits/symbol |
-| Preamble | 4 OFDM symbols | Known QPSK, per-frame |
+| Preamble | 8 OFDM symbols | Known QPSK, per-frame — wider autocorrelation lobe for drift tolerance |
 | Symbol duration | 288 samples (6 ms) | CP + FFT |
 | Symbol rate | 166.7 Hz | 48000/288 |
 | Data syms/frame | 35 | Computed dynamically from payload_size |
-| Frame time | 234 ms | 4 preamble + 35 data syms |
+| Frame time | 258 ms | 8 preamble + 35 data syms |
 | Payload per frame | 442 B | 2 RS(255,223) blocks, CRC-32 |
 
 ### Throughput
@@ -38,11 +38,11 @@ alsa_input.usb-0c76_USB_PnP_Audio-01.mono    (input, "USB_PnP")
 | Layer | Bits/sym | Symbol rate | Raw bps | Overhead | Net bps |
 |-------|----------|-------------|---------|----------|---------|
 | Modulation (60× QPSK) | 120 | 166.7 Hz | 20,000 | — | 20,000 |
-| OFDM (35 data / 39 total) | — | — | 20,000 | ×0.897 | 17,949 |
-| Framing (522B → 442B payload) | — | — | 17,949 | ×0.847 | 15,200 |
-| RS(32) FEC (223/255) | — | — | 15,200 | ×0.875 | 13,300 |
+| OFDM (35 data / 43 total) | — | — | 20,000 | ×0.814 | 16,279 |
+| Framing (522B → 442B payload) | — | — | 16,279 | ×0.847 | 13,787 |
+| RS(32) FEC (223/255) | — | — | 13,787 | ×0.875 | 12,064 |
 
-The Shrek target is ~8.5 kbps, giving **1.8× headroom** with current config.
+The Shrek target is ~8.5 kbps, giving **1.6× headroom** with current config.
 
 ### Phase Tracking
 
@@ -81,18 +81,21 @@ Instead of one preamble for the entire burst, **each frame gets its own preamble
 
 | Duration | Frames | Received | Rate |
 |----------|--------|----------|------|
-| 30 s (68 frames) | 66/68 | 97% | Latest (SC 10-69, 60 SC) |
+| 30 s (68 frames) | 68/68 | 100% | Latest (SC 10-69, 60 SC, 8 preamble) |
+| 30 s (68 frames) | 66/68 | 97% | Previous (SC 10-69, 60 SC, 4 preamble) |
 | 30 s (68 frames) | 55/68 | 81% | Baseline (SC 9-43, 35 SC) |
-| 60 s (150 frames) | 141/150 | 94% | Best (SC 9-43) |
+| 60 s (150 frames) | 141/150 | 94% | Best (SC 9-43, 4 preamble) |
 
 The improvement from 81% to 97% when moving to per-frame analysis (vs sequential grid alignment) indicates frames are detected independently but misalignment caused false negatives in earlier analysis.
 
-### Frame Loss Pattern
+### Frame Loss Pattern (Historical)
 
-- **Losses are binary**: every received frame is byte-perfect; missing frames are completely absent
-- Only 2 frames lost in the best 30 s run (frames 22 and 42)
-- Loss is likely from short noise bursts or preamble detection misses — RS(32) is never the bottleneck (no partial-error frames exist)
-- To recover lost frames: improve preamble detection (not stronger FEC)
+- **Losses were binary** during development: every received frame was byte-perfect; missing frames were completely absent
+- With **8 preamble symbols** + position tracking + lower detection threshold, 100% frame reception is achieved at 30 s
+- Loss was driven by two root causes, both now addressed:
+  1. **Autocorrelation null**: µs-scale timing drift (~4 samples) from TX/RX clock skew (7.5 ppm) placed the preamble at the null of the wideband OFDM autocorrelation. Fixed by increasing preamble from 4→8 symbols (wider lobe) and using ≤0.05 detection thresholds.
+  2. **Frame skipping**: global argmax over the full buffer found a later frame's stronger preamble. Fixed by position tracking after first acquisition.
+- Loss of frame 0 during acquisition was fixed by sliding 0.5 sym on decode failure (instead of advancing by frame_samples).
 
 ## Commands
 
@@ -242,9 +245,9 @@ Each frame: 522 total bytes
 ## Next Steps
 
 1. ✅ **SC range expanded** 9-43 → 10-69 based on OTA frequency response measurement
-2. ✅ **Frame duration reduced** 60 → 35 data syms (384 ms → 234 ms, 39% shorter)
-3. ✅ **OTAs reliability characterized** 97% at 30 s, binary frame loss pattern
-4. 🔲 **Reduce preamble miss rate** — increase preamble symbols (4→6 or 8), or lower threshold with CRC catch
+2. ✅ **Frame duration reduced** 60 → 35 data syms (384 ms → 258 ms, 33% shorter)
+3. ✅ **OTAs reliability characterized** 100% at 30 s with 8 preamble, binary frame loss pattern
+4. ✅ **Reduce preamble miss rate** — increased preamble 4→8 symbols, position tracking, lower threshold
 5. 🔲 **On-the-fly TX generation** — avoid O(1 GB) audio buffer for 90-min Shrek
 
 ## Relevant Files

@@ -15,10 +15,11 @@ all framing, FEC, and modulation overhead.
 
 ## Current Status: TARGET EXCEEDED
 
-**15.1 kbps net throughput** — 1.8× the 8.5 kbps target.
+**12.1 kbps net throughput** — 1.4× the 8.5 kbps target.
 
 Measured over **open air** (PC speaker → USB desk mic, ~30 cm):
-- 30 s: **66/68 frames (97%)** — SC 10-69, 60 SC, QPSK, CP=32
+- 30 s: **68/68 frames (100%)** — SC 10-69, 60 SC, QPSK, CP=32, 8 preamble
+- 30 s: **66/68 frames (97%)** — SC 10-69, 60 SC, QPSK, CP=32, 4 preamble (previous)
 - 60 s: **141/150 frames (94%)** — SC 9-43, 35 SC (previous config)
 
 All received frames have **0 byte errors** — the channel is binary
@@ -37,15 +38,19 @@ the bottleneck.
 | 4 | **CP=32** (was CP=128) | `src/config.py` | 37 | 150 Hz → 167 Hz symbol rate. 0.67 ms guard still sufficient at 30 cm. |
 | 5 | **SC range 10-69** (was 9-43 / 60 SC vs 35 SC) | `src/config.py` | 39-40 | Uses full -3 dB bandwidth of USB mic (750-12938 Hz). Avoids dip at SC 7-9. |
 | 6 | **No pilot subcarriers** (was 4) | `src/config.py` | 42 | Saves 4/60 = 6.7% overhead. DD tracking reliable enough without pilots. |
-| 7 | **35 data syms/frame** (was 60) | `examples/demo_rx.py` | 28-37 | Dynamic computation from config. Reduces frame time 384 → 234 ms (39% shorter). |
+| 7 | **35 data syms/frame** (was 60) | `examples/demo_rx.py` | 28-37 | Dynamic computation from config. Reduces frame time 384 → 258 ms (33% shorter). |
 | 8 | **No buffer pruning** | `examples/demo_rx.py` | 49 | Pruning caused cumulative 1-sample/frame drift → preamble misses at 277+ frames. |
 | 9 | **TX polling wait** | `examples/demo_tx.py` | 78-80 | Replaced `time.sleep` with `while tx_pos[0] < len(audio)` to prevent truncation. |
 | 10 | **Signal handlers** | `examples/demo_rx.py` | 57-62 | SIGINT/SIGTERM flush output cleanly. |
 | 11 | **Output flush on success** | `examples/demo_rx.py` | 117 | Explicit flush after each frame for pipe reliability. |
 | 12 | **Mic frequency response measurement** | `/tmp/freq_sweep3.py` | — | Full-band OFDM sweep (SC 1-127, 8 syms). Confirmed -3 dB at SC 4-69, dip at SC 7-9. |
 | 13 | **Per-frame architecture** | `demo_tx.py`, `demo_rx.py` | — | Each frame has own preamble. PLL resets per frame, unlimited duration, no AGC adaptation. |
-| 14 | **Fixed test_stream_pipe.py data size** | `examples/test_stream_pipe.py` | 16-17 | Now computed from config instead of hardcoded 1784. |
-| 15 | **Fixed demo_pipeline.py default input** | `examples/demo_pipeline.py` | 13 | Changed from `/tmp/shrek_10f.bin` to `/tmp/shrek_test_30s.bin`. |
+| 14 | **8 preamble symbols** (was 4) | `src/config.py` | 44 | Wider autocorrelation lobe tolerates ±4 sample timing drift without hitting null. |
+| 15 | **Position tracking** (after acq) | `examples/demo_rx.py` | 99-100 | Uses search_pos directly as abs_pos, eliminating argmax frame-skipping. |
+| 16 | **Lower process_samples threshold** | `src/physical/ofdm.py` | 57 | norm_peak 0.10→0.05 catches frames in the signal dip region. |
+| 17 | **Acquisition slides on decode failure** | `examples/demo_rx.py` | 148-149 | Prevents false positive from advancing past frame 0. |
+| 18 | **Fixed test_stream_pipe.py data size** | `examples/test_stream_pipe.py` | 16-17 | Now computed from config instead of hardcoded 1784. |
+| 19 | **Fixed demo_pipeline.py default input** | `examples/demo_pipeline.py` | 13 | Changed from `/tmp/shrek_10f.bin` to `/tmp/shrek_test_30s.bin`. |
 
 ---
 
@@ -59,7 +64,7 @@ subcarrier_min: int = 10     # 1875 Hz
 subcarrier_max: int = 69     # 12938 Hz
 bits_per_subcarrier: int = 2  # QPSK
 pilot_subcarriers: tuple = ()
-preamble_symbols: int = 4
+preamble_symbols: int = 8    # wider autocorrelation lobe for drift tolerance
 
 # src/config.py FrameConfig
 payload_size: int = 442       # 2 RS(255,223) blocks
@@ -73,11 +78,11 @@ nsym: int = 32                # 16 byte errors corrected per block
 | Layer | Bits/sym | Symbol rate | Raw bps | Overhead | Net bps |
 |-------|----------|-------------|---------|----------|---------|
 | Modulation (60× QPSK) | 120 | 166.7 Hz | 20,000 | — | 20,000 |
-| OFDM (35 data / 39 total) | — | — | 20,000 | ×0.897 | 17,949 |
-| Framing (522 B → 442 B payload) | — | — | 17,949 | ×0.847 | 15,200 |
-| RS(32) FEC (223/255) | — | — | 15,200 | ×0.875 | 13,300 |
+| OFDM (35 data / 43 total) | — | — | 20,000 | ×0.814 | 16,279 |
+| Framing (522 B → 442 B payload) | — | — | 16,279 | ×0.847 | 13,787 |
+| RS(32) FEC (223/255) | — | — | 13,787 | ×0.875 | 12,064 |
 
-Effective: **15.1 kbps** (1.8× headroom vs 8.5 kbps target)
+Effective: **12.1 kbps** (1.4× headroom vs 8.5 kbps target)
 
 ---
 
@@ -197,11 +202,12 @@ verify names before each test session.
 USB mic (different host API than motherboard output), split-duplex is
 required. The fallback adds ~50 ms latency.
 
-### 7. Frame Loss Is Binary
+### 7. Frame Loss Was Binary (Now Fixed)
 
-Every received frame has 0 byte errors. Lost frames are completely
-absent (preamble not detected or RS uncorrectable). Stronger RS will
-not help — the fix is better preamble detection.
+Every received frame had 0 byte errors. Lost frames were completely
+absent (preamble not detected or RS uncorrectable). With 8 preamble
+symbols + position tracking + lower threshold, the loss is eliminated
+at 30 s (68/68 frames over 5 consecutive runs).
 
 ---
 
@@ -209,7 +215,7 @@ not help — the fix is better preamble detection.
 
 ```
 src/
-├── config.py           ← Default OFDM params (CP=32, SC=10-69, no pilots, QPSK)
+├── config.py           ← Default OFDM params (CP=32, SC=10-69, no pilots, QPSK, 8 preamble)
 ├── audio/
 │   ├── io.py           ← AudioStream (full-duplex + split-duplex)
 │   ├── loopback.py     ← LoopbackTester (burst TX → RX → verify, legacy)
