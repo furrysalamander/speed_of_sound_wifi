@@ -51,6 +51,8 @@ the bottleneck.
 | 17 | **Acquisition slides on decode failure** | `examples/demo_rx.py` | 148-149 | Prevents false positive from advancing past frame 0. |
 | 18 | **Fixed test_stream_pipe.py data size** | `examples/test_stream_pipe.py` | 16-17 | Now computed from config instead of hardcoded 1784. |
 | 19 | **Fixed demo_pipeline.py default input** | `examples/demo_pipeline.py` | 13 | Changed from `/tmp/shrek_10f.bin` to `/tmp/shrek_test_30s.bin`. |
+| 20 | **On-the-fly TX generation** | `examples/demo_tx.py` | 46-69 | Generates frame audio in callback buffer to avoid O(1 GB) pre-generation for 90-min clips. |
+| 21 | **Pipeline timeout extended** | `examples/demo_pipeline.py` | 51 | TX subprocess timeout 30→600 s for long clips. |
 
 ---
 

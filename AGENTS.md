@@ -160,12 +160,20 @@ python -m examples.test_ota_demo
 ### Prepare Test Clips
 
 ```bash
-# Create a 30-second test clip (68 frames of 442 B):
+# Create a 30-second test clip (68 frames of 442 B from Shrek source):
 python -c "
-data = open('/tmp/shrek_30s.webm', 'rb').read()  # or any test data
+data = open('absolute_smallest_shrek_v2_stripped.webm', 'rb').read()
 ps = 442
-n = (len(data) + ps - 1) // ps
-data += b'\x00' * (n * ps - len(data))
+n = 68  # 30 seconds at 258 ms/frame
+data = data[:n * ps] + b'\x00' * (n * ps - len(data[:n * ps]))
+open('/tmp/shrek_test_30s.bin', 'wb').write(data)
+"
+
+# Or use any random data:
+python -c "
+from src.config import Config
+ps = Config().frame.payload_size
+data = bytes(i % 256 for i in range(68 * ps))
 open('/tmp/shrek_test_30s.bin', 'wb').write(data)
 "
 ```
@@ -214,11 +222,12 @@ Each frame: 522 total bytes
 
 1. Read input file
 2. Pad to payload_size boundary
-3. For each frame: assemble (sync + RS + CRC), modulate with own preamble
-4. Concatenate all frame audio
-5. Append 0.5 s silence
-6. Play via callback (audio stream)
-7. Poll `tx_pos[0]` until all samples consumed
+3. Register audio callback that generates frame audio on-the-fly
+4. For each frame: assemble (sync + RS + CRC), modulate with own preamble
+5. Generated frames stored in a buffer; new frames generated when callback consumes ahead
+6. Append 0.5 s silence after all frames generated
+7. Play via callback (audio stream)
+8. Poll `tx_pos[0]` until all samples consumed
 
 ### RX Flow (demo_rx.py)
 
@@ -248,7 +257,7 @@ Each frame: 522 total bytes
 2. ✅ **Frame duration reduced** 60 → 35 data syms (384 ms → 258 ms, 33% shorter)
 3. ✅ **OTAs reliability characterized** 100% at 30 s with 8 preamble, binary frame loss pattern
 4. ✅ **Reduce preamble miss rate** — increased preamble 4→8 symbols, position tracking, lower threshold
-5. 🔲 **On-the-fly TX generation** — avoid O(1 GB) audio buffer for 90-min Shrek
+5. ✅ **On-the-fly TX generation** — avoid O(1 GB) audio buffer for 90-min Shrek
 
 ## Relevant Files
 
