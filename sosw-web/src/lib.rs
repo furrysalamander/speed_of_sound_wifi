@@ -50,18 +50,18 @@ async fn read_file_as_bytes(file: web_sys::File) -> Result<Vec<u8>, JsValue> {
     let promise = js_sys::Promise::new(&mut |resolve, reject| {
         let reader = match web_sys::FileReader::new() {
             Ok(r) => r,
-            Err(e) => { reject.call1(&JsValue::NULL, &e); return; }
+            Err(e) => { let _ = reject.call1(&JsValue::NULL, &e); return; }
         };
         let r_clone = reader.clone();
         let onload = Closure::<dyn FnMut()>::new(move || {
             match r_clone.result() {
-                Ok(val) => { resolve.call1(&JsValue::NULL, &val); }
-                Err(e) => { reject.call1(&JsValue::NULL, &e); }
+                Ok(val) => { let _ = resolve.call1(&JsValue::NULL, &val); }
+                Err(e) => { let _ = reject.call1(&JsValue::NULL, &e); }
             }
         });
         reader.set_onloadend(Some(onload.as_ref().unchecked_ref()));
         onload.forget();
-        reader.read_as_array_buffer(&file);
+        let _ = reader.read_as_array_buffer(&file);
     });
 
     let buf = wasm_bindgen_futures::JsFuture::from(promise).await?;

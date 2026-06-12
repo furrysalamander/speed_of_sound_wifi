@@ -3,13 +3,11 @@ use wasm_bindgen::JsCast;
 use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement, ImageData};
 
 pub struct Waterfall {
-    canvas: HtmlCanvasElement,
     ctx: CanvasRenderingContext2d,
     width: u32,
     height: u32,
     buffer: Vec<u8>,
     col: u32,
-    fft_size: usize,
 }
 
 impl Waterfall {
@@ -25,13 +23,11 @@ impl Waterfall {
         let buffer = vec![0u8; buf_len];
 
         Ok(Self {
-            canvas,
             ctx,
             width,
             height,
             buffer,
             col: 0,
-            fft_size: 256,
         })
     }
 
@@ -69,8 +65,8 @@ impl Waterfall {
     }
 
     pub fn render(&mut self) {
-        let w = self.width as usize;
-        let h = self.height as usize;
+        let _w = self.width as usize;
+        let _h = self.height as usize;
 
         let image_data = match ImageData::new_with_u8_clamped_array_and_sh(
             wasm_bindgen::Clamped(&self.buffer),

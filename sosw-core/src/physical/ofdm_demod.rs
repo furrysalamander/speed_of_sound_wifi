@@ -1,6 +1,5 @@
 use crate::config::Config;
 use crate::link::scrambler::Scrambler;
-use crate::physical::ofdm_mod::OfdmModulatorInner;
 use crate::physical::preamble;
 use crate::physical::qpsk;
 use ndarray::Array1;
@@ -20,11 +19,9 @@ pub struct OfdmDemodulator {
     config: Config,
     fft: Arc<dyn rustfft::Fft<f32>>,
     preamble_audio: Vec<f32>,
-    preamble_rev: Vec<f32>,
     preamble_energy: f32,
     preamble_symbols_fd: Vec<Vec<num_complex::Complex32>>,
     scrambler: Scrambler,
-    inner: OfdmModulatorInner,
     channel_est: Array1<Complex32>,
     dd_common: f32,
     dd_slope: f32,
@@ -43,12 +40,10 @@ impl OfdmDemodulator {
         let fft = planner.plan_fft_forward(fft_size);
 
         let preamble_audio = preamble::generate_preamble_audio(config);
-        let preamble_rev: Vec<f32> = preamble_audio.iter().rev().copied().collect();
         let preamble_energy: f32 = preamble_audio.iter().map(|&s| s * s).sum::<f32>().max(1e-12);
 
         let preamble_symbols_fd = preamble::generate_preamble_symbols(config);
         let scrambler = Scrambler::new(config.scrambler_seed);
-        let inner = OfdmModulatorInner::new(config);
 
         let n_sc = config.active_subcarriers();
         let sc_min = config.sc_min;
@@ -61,11 +56,9 @@ impl OfdmDemodulator {
             config: config.clone(),
             fft,
             preamble_audio,
-            preamble_rev,
             preamble_energy,
             preamble_symbols_fd,
             scrambler,
-            inner,
             channel_est: Array1::zeros(fft_size),
             dd_common: 0.0,
             dd_slope: 0.0,
@@ -252,7 +245,7 @@ impl OfdmDemodulator {
             }
 
             let mut equalized = Vec::with_capacity(n_sc);
-            for (i, sc_idx) in (sc_min..sc_min + n_sc).enumerate() {
+            for (_, sc_idx) in (sc_min..sc_min + n_sc).enumerate() {
                 let h = self.channel_est[sc_idx];
                 if h.norm_sqr() > 1e-20 {
                     equalized.push(fd_slice[sc_idx] / h);

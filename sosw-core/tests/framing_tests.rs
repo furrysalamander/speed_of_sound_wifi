@@ -5,7 +5,7 @@ use sosw_core::link::frame::{FrameAssembler, FrameParser};
 #[test]
 fn test_crc_roundtrip() {
     let data = b"Hello, OFDM!";
-    let crc = crc::compute_crc32(data);
+    let _crc = crc::compute_crc32(data);
 
     let mut with_crc = data.to_vec();
     crc::compute_and_append_crc(&mut with_crc);
@@ -67,7 +67,7 @@ fn test_frame_with_noise() {
     let mut parser = FrameParser::new(&config);
 
     let payload: Vec<u8> = vec![0x42; 100];
-    let mut frame = assembler.assemble_frame(&payload);
+    let frame = assembler.assemble_frame(&payload);
 
     // Add some byte noise before the frame
     let noisy: Vec<u8> = vec![0xAA, 0xBB, 0xCC, 0xDD];

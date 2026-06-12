@@ -13,7 +13,6 @@ pub struct ParsedFrame {
 }
 
 pub struct FrameAssembler {
-    config: Config,
     fec: ReedSolomonFec,
     sequence_number: u16,
 }
@@ -22,7 +21,6 @@ impl FrameAssembler {
     pub fn new(config: &Config) -> Self {
         let fec = ReedSolomonFec::new(config.rs_nsym);
         Self {
-            config: config.clone(),
             fec,
             sequence_number: 0,
         }
@@ -56,7 +54,6 @@ impl FrameAssembler {
 }
 
 pub struct FrameParser {
-    config: Config,
     fec: ReedSolomonFec,
     buffer: Vec<u8>,
     pub frames_received: usize,
@@ -73,7 +70,6 @@ impl FrameParser {
         let payload_max = config.payload_size;
         let max_blocks = (4 + payload_max + msg_len - 1) / msg_len;
         Self {
-            config: config.clone(),
             fec,
             buffer: Vec::new(),
             frames_received: 0,

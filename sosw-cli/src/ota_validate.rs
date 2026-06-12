@@ -3,7 +3,6 @@
 use clap::Parser;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use sosw_core::config::Config;
-use sosw_core::physical::ofdm_demod::DemodResult;
 use sosw_core::physical::ofdm_demod::OfdmDemodulator;
 use sosw_core::physical::ofdm_mod::OfdmModulator;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

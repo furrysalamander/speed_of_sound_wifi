@@ -104,10 +104,10 @@ pub async fn start_rx() -> Result<RxHandle, JsValue> {
 // ── TX ──────────────────────────────────────────────────────────
 
 pub struct TxPlayback {
-    audio_ctx: web_sys::AudioContext,
+    _audio_ctx: web_sys::AudioContext,
     _source: web_sys::AudioBufferSourceNode,
     duration_ms: f64,
-    on_done: Option<Closure<dyn FnMut()>>,
+    _on_done: Option<Closure<dyn FnMut()>>,
 }
 
 impl TxPlayback {
@@ -139,17 +139,18 @@ pub fn play_audio(
     source.connect_with_audio_node(&ctx.destination())?;
 
     let done = Closure::<dyn FnMut()>::new(on_complete);
-    source.set_onended(Some(done.as_ref().unchecked_ref()));
+    let callback = done.as_ref().unchecked_ref();
+    source.add_event_listener_with_callback("ended", callback)?;
 
     source.start()?;
 
     let duration_ms = (len as f64) / (sample_rate as f64) * 1000.0;
 
     Ok(TxPlayback {
-        audio_ctx: ctx,
+        _audio_ctx: ctx,
         _source: source,
         duration_ms,
-        on_done: Some(done),
+        _on_done: Some(done),
     })
 }
 
