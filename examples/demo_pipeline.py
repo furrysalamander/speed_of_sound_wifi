@@ -11,7 +11,7 @@ import time
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", default="/tmp/shrek_test_30s.bin",
-                        help="Input payload file (default: 10-frame Shrek clip)")
+                        help="Input payload file (default: 30s Shrek clip)")
     parser.add_argument("--tx-device", default="analog-stereo",
                         help="Output (TX) device name")
     parser.add_argument("--rx-device", default="USB_PnP",
@@ -48,7 +48,7 @@ def main():
         [sys.executable, "-m", "examples.demo_tx",
          "--input", args.input,
          "--input-name", args.tx_device],
-        capture_output=True, text=True, timeout=30,
+        capture_output=True, text=True, timeout=600,
     )
 
     try:
