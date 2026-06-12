@@ -1,5 +1,6 @@
 use leptos::prelude::*;
 use wasm_bindgen::prelude::*;
+use wasm_bindgen::JsCast;
 
 mod audio;
 
@@ -43,11 +44,36 @@ fn App() -> impl IntoView {
     }
 }
 
+/// Read a File into a Vec<u8> using a promise_wrapper pattern
+async fn read_file_as_bytes(file: web_sys::File) -> Result<Vec<u8>, JsValue> {
+    let promise = js_sys::Promise::new(&mut |resolve, reject| {
+        let reader = match web_sys::FileReader::new() {
+            Ok(r) => r,
+            Err(e) => { reject.call1(&JsValue::NULL, &e); return; }
+        };
+        let r_clone = reader.clone();
+        let onload = Closure::<dyn FnMut()>::new(move || {
+            match r_clone.result() {
+                Ok(val) => { resolve.call1(&JsValue::NULL, &val); }
+                Err(e) => { reject.call1(&JsValue::NULL, &e); }
+            }
+        });
+        reader.set_onloadend(Some(onload.as_ref().unchecked_ref()));
+        onload.forget();
+        reader.read_as_array_buffer(&file);
+    });
+
+    let buf = wasm_bindgen_futures::JsFuture::from(promise).await?;
+    let uint8 = js_sys::Uint8Array::new(&buf);
+    let mut bytes = vec![0u8; uint8.length() as usize];
+    uint8.copy_to(&mut bytes);
+    Ok(bytes)
+}
+
 #[component]
 fn RxPanel() -> impl IntoView {
     let running = RwSignal::new(false);
     let frames = RwSignal::new(0u32);
-    let valid_frames = RwSignal::new(0u32);
     let last_peak = RwSignal::new(0.0f32);
     let last_cfo = RwSignal::new(0.0f32);
     let status = RwSignal::new(String::from("Ready"));
@@ -67,7 +93,6 @@ fn RxPanel() -> impl IntoView {
                     while running.get() {
                         if let Some(r) = rx.poll() {
                             frames.update(|n| *n += 1);
-                            valid_frames.update(|n| *n += 1);
                             last_peak.set(r.preamble_peak);
                             last_cfo.set(r.cfo_rad_per_sym);
                             status.set(format!("Frame {}", frames.get()));
@@ -98,10 +123,6 @@ fn RxPanel() -> impl IntoView {
                     <span class="val">{move || frames.get()}</span>
                 </div>
                 <div class="stat">
-                    <label>"Valid"</label>
-                    <span class="val">{move || valid_frames.get()}</span>
-                </div>
-                <div class="stat">
                     <label>"Preamble Peak"</label>
                     <span class="val">{move || format!("{:.3}", last_peak.get())}</span>
                 </div>
@@ -110,32 +131,124 @@ fn RxPanel() -> impl IntoView {
                     <span class="val">{move || format!("{:.4}", last_cfo.get())}</span>
                 </div>
             </div>
-            <canvas></canvas>
+            <canvas height="200"></canvas>
         </div>
     }
 }
 
 #[component]
 fn TxPanel() -> impl IntoView {
-    let frame_count = RwSignal::new(0u32);
-    let status = RwSignal::new(String::from("Upload a file to transmit"));
+    let status = RwSignal::new(String::from("Select a file to transmit"));
+    let progress = RwSignal::new(0.0f32);
+    let playing = RwSignal::new(false);
+    let file_data = RwSignal::new(Vec::<u8>::new());
+    let file_name = RwSignal::new(String::new());
 
-    let _start_tx = move |_: leptos::ev::MouseEvent| {
+    let on_file_select = move |_| {
+        let document = web_sys::window().and_then(|w| w.document());
+        if let Some(doc) = document {
+            if let Some(input) = doc.get_element_by_id("file-input") {
+                if let Ok(input) = input.dyn_into::<web_sys::HtmlInputElement>() {
+                    if let Some(files) = input.files() {
+                        if let Some(file) = files.get(0) {
+                            let fname = file.name();
+                            status.set(format!("Loading: {}", fname));
+                            file_name.set(fname.clone());
+                            leptos::task::spawn_local({
+                                let status = status.clone();
+                                let file_data = file_data.clone();
+                                async move {
+                                    match read_file_as_bytes(file).await {
+                                        Ok(bytes) => {
+                                            file_data.set(bytes.clone());
+                                            status.set(format!("Loaded {} ({} bytes)", fname, bytes.len()));
+                                        }
+                                        Err(e) => {
+                                            status.set(format!("Read error: {:?}", e));
+                                        }
+                                    }
+                                }
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    let start_tx = move |_| {
+        if playing.get() || file_data.get().is_empty() {
+            return;
+        }
+        playing.set(true);
+        progress.set(0.0);
+        status.set("Modulating...".to_string());
+
+        let data = file_data.get();
         leptos::task::spawn_local(async move {
-            status.set("TX started...".to_string());
-            status.set("TX complete".to_string());
+            let samples = audio::modulate_frame(&data);
+            let sample_rate = 48000.0f32;
+            let total_ms = (samples.len() as f64 / sample_rate as f64) * 1000.0;
+            status.set(format!("Playing ({:.0} ms)", total_ms));
+
+            let done = {
+                let playing = playing.clone();
+                let status = status.clone();
+                let fname = file_name.get();
+                move || {
+                    playing.set(false);
+                    status.set(format!("Done: {}", fname));
+                }
+            };
+
+            match audio::play_audio(samples, sample_rate, done) {
+                Ok(tx) => {
+                    let dur = tx.duration_ms();
+                    let interval_ms = (dur / 20.0).max(50.0) as u64;
+                    for _ in 0..20 {
+                        if !playing.get() { break; }
+                        let p = progress.get();
+                        progress.set(p + 0.05);
+                        gloo_timers::future::sleep(std::time::Duration::from_millis(interval_ms)).await;
+                    }
+                    tx.stop();
+                }
+                Err(e) => {
+                    status.set(format!("Play error: {:?}", e));
+                    playing.set(false);
+                }
+            }
         });
     };
 
     view! {
         <div class="panel">
             <div class="row">
+                <input
+                    id="file-input"
+                    type="file"
+                    on:change=on_file_select
+                    style="display:none"
+                />
+                <button on:click=move |_| { let doc = web_sys::window().and_then(|w| w.document()); if let Some(d) = doc { if let Some(el) = d.get_element_by_id("file-input") { if let Ok(input) = el.dyn_into::<web_sys::HtmlInputElement>() { let html: &web_sys::HtmlElement = input.as_ref(); html.click(); } } } }>
+                    "Choose File"
+                </button>
+                <button
+                    on:click=start_tx
+                    disabled=move || file_data.get().is_empty() || playing.get()
+                >
+                    {move || if playing.get() { "Playing..." } else { "Transmit" }}
+                </button>
                 <span>{move || status.get()}</span>
             </div>
             <div class="stats">
-                <div class="stat">
-                    <label>"Frames sent"</label>
-                    <span class="val">{move || frame_count.get()}</span>
+                <div class="stat" style="grid-column: 1 / -1">
+                    <label>"Progress"</label>
+                    <progress
+                        max="20"
+                        value=move || (progress.get() * 20.0) as i32
+                        style="width:100%"
+                    ></progress>
                 </div>
             </div>
         </div>

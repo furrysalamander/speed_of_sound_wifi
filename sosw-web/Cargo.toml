@@ -14,12 +14,14 @@ getrandom = { version = "0.3", features = ["wasm_js"] }
 web-sys = { version = "0.3", features = [
     "AudioContext", "AudioContextOptions", "ScriptProcessorNode",
     "AudioProcessingEvent",
+    "AudioBuffer", "AudioBufferSourceNode",
     "MediaStream", "MediaStreamAudioSourceNode", "MediaDevices",
     "HtmlCanvasElement", "CanvasRenderingContext2d", "ImageData",
-    "AudioBuffer", "AudioNode", "AudioDestinationNode",
-    "MediaStreamConstraints",
+    "AudioNode", "AudioDestinationNode",
+    "MediaStreamConstraints", "MediaTrackConstraints",
     "Window", "Navigator",
     "HtmlElement", "Document", "Element",
+    "FileReader", "File", "Blob", "FileList", "HtmlInputElement",
 ] }
 js-sys = "0.3"
 wasm-bindgen-futures = "0.4"
