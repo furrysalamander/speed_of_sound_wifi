@@ -3,7 +3,7 @@
 #    TX (speaker) -> [OTA] -> RX (USB mic) -> ffplay
 #
 # ffplay needs a complete WebM header to start, so the pipeline buffers
-# the first ~16 kB of decoded bytes before spawning ffplay.
+# the first ~16 kB of decoded bytes before spawning ffplay (with display).
 #
 # Usage:
 #   python -m examples.demo_pipeline                  # auto 30s test clip + ffplay
@@ -107,7 +107,7 @@ def main():
                             probed = True
                             print(f"Spawning ffplay ({total:,} B)...", flush=True)
                             ffplay_proc = subprocess.Popen(
-                                ["ffplay", "-i", "pipe:0", "-an", "-nodisp",
+                                ["ffplay", "-i", "pipe:0", "-an",
                                  "-loglevel", "quiet"],
                                 stdin=subprocess.PIPE,
                                 stdout=subprocess.DEVNULL,
