@@ -123,37 +123,6 @@ fn device_label(d: &cpal::Device) -> String {
     }
 }
 
-fn supported_stream_config(
-    device: &cpal::Device,
-    desired_rate: u32,
-    desired_channels: u16,
-) -> Option<cpal::StreamConfig> {
-    let check_cfgs = |cfgs: Vec<cpal::SupportedStreamConfigRange>| -> Option<cpal::StreamConfig> {
-        for cfg in cfgs {
-            let rate_range = cfg.min_sample_rate()..=cfg.max_sample_rate();
-            if rate_range.contains(&desired_rate) && cfg.channels() >= desired_channels {
-                return Some(cpal::StreamConfig {
-                    channels: desired_channels,
-                    sample_rate: desired_rate,
-                    buffer_size: cpal::BufferSize::Default,
-                });
-            }
-        }
-        None
-    };
-
-    if let Ok(cfgs) = device.supported_input_configs() {
-        let v: Vec<_> = cfgs.collect();
-        if let Some(c) = check_cfgs(v) { return Some(c); }
-    }
-    if let Ok(cfgs) = device.supported_output_configs() {
-        let v: Vec<_> = cfgs.collect();
-        if let Some(c) = check_cfgs(v) { return Some(c); }
-    }
-    device.default_output_config().ok().map(|c| c.config())
-        .or_else(|| device.default_input_config().ok().map(|c| c.config()))
-}
-
 fn find_device(host: &cpal::Host, name: &str, input: bool) -> anyhow::Result<cpal::Device> {
     let devices: Vec<cpal::Device> = if input {
         host.input_devices()?.collect()
@@ -224,26 +193,8 @@ fn ota_loopback(
     eprintln!("  RX device: {}", device_label(&rx_device));
 
     let sample_rate = config.sample_rate;
-
-    let tx_channels = tx_device.supported_output_configs()
-        .ok().and_then(|mut cfgs| cfgs.next().map(|c| c.channels()))
-        .unwrap_or(1).max(1).min(2);
-    let rx_channels = rx_device.supported_input_configs()
-        .ok().and_then(|mut cfgs| cfgs.next().map(|c| c.channels()))
-        .unwrap_or(1).max(1);
-
-    let tx_config = supported_stream_config(&tx_device, sample_rate, tx_channels)
-        .unwrap_or(cpal::StreamConfig {
-            channels: tx_channels,
-            sample_rate,
-            buffer_size: cpal::BufferSize::Default,
-        });
-    let rx_config = supported_stream_config(&rx_device, sample_rate, rx_channels)
-        .unwrap_or(cpal::StreamConfig {
-            channels: rx_channels,
-            sample_rate,
-            buffer_size: cpal::BufferSize::Default,
-        });
+    let tx_config = tx_device.default_output_config()?.config();
+    let rx_config = rx_device.default_input_config()?.config();
 
     eprintln!("  TX config: {} Hz, {} ch", tx_config.sample_rate, tx_config.channels);
     eprintln!("  RX config: {} Hz, {} ch", rx_config.sample_rate, rx_config.channels);
@@ -254,10 +205,8 @@ fn ota_loopback(
     eprintln!("  RX device: {} (detected)", rx_name);
     eprintln!("  Ensure speaker is audible to the microphone!");
 
-    // Scale to avoid PulseAudio clipping
-    let use_pulse = tx_name.to_lowercase().contains("pulse") || tx_name == "default";
     let max_tx = audio.iter().map(|&s| s.abs()).fold(0.0f32, f32::max);
-    let target_amp = if use_pulse { 0.02 } else { 0.08 };
+    let target_amp = 0.08;
     let tx_scale = if max_tx > 0.0 { (target_amp / max_tx).min(1.0) } else { 1.0 };
     let scaled_audio: Vec<f32> = if tx_scale < 1.0 {
         audio.iter().map(|&s| s * tx_scale).collect()
@@ -265,73 +214,36 @@ fn ota_loopback(
         audio.to_vec()
     };
     let audio_arc = Arc::new(scaled_audio);
-    if tx_scale < 0.99 {
-        eprintln!("  TX scale: {:.4} ({} mode)", tx_scale, if use_pulse { "pulse" } else { "hw" });
-    }
-    let audio_tx_f32 = audio_arc.clone();
-    let audio_tx_i16 = audio_arc.clone();
-    let audio_keep = audio_arc.clone();
 
     let tx_offset = Arc::new(AtomicUsize::new(0));
     let tx_done = Arc::new(AtomicBool::new(false));
-    let tx_channels_out = tx_config.channels as usize;
 
     let tx_stream: cpal::Stream = {
         let off = tx_offset.clone();
         let dn = tx_done.clone();
-        let a = audio_tx_f32.clone();
-        let result = tx_device.build_output_stream::<f32, _, _>(
+        let a = audio_arc;
+        tx_device.build_output_stream::<f32, _, _>(
             tx_config,
             move |data: &mut [f32], _info: &cpal::OutputCallbackInfo| {
                 let o = off.load(Ordering::SeqCst);
-                let remain = a.len().saturating_sub(o);
-                let n = data.len().min(remain * tx_channels_out);
                 for (i, s) in data.iter_mut().enumerate() {
-                    *s = a.get(o + i / tx_channels_out).copied().unwrap_or(0.0);
+                    *s = a.get(o + i).copied().unwrap_or(0.0);
                 }
-                off.store(o + n / tx_channels_out, Ordering::SeqCst);
-                if o + n / tx_channels_out >= a.len() { dn.store(true, Ordering::SeqCst); }
+                off.store(o + data.len(), Ordering::SeqCst);
+                if o + data.len() >= a.len() { dn.store(true, Ordering::SeqCst); }
             },
             |err| eprintln!("TX error: {}", err),
             None,
-        );
-        match result {
-            Ok(s) => s,
-            Err(_) => {
-                eprintln!("  F32 TX failed, trying I16...");
-                let off = tx_offset.clone();
-                let dn = tx_done.clone();
-                let a = audio_tx_i16.clone();
-                tx_device.build_output_stream::<i16, _, _>(
-                    tx_config,
-                    move |data: &mut [i16], _info: &cpal::OutputCallbackInfo| {
-                        let o = off.load(Ordering::SeqCst);
-                        let remain = a.len().saturating_sub(o);
-                        let n = data.len().min(remain * tx_channels_out);
-                        for (i, s) in data.iter_mut().enumerate() {
-                            let mono = a.get(o + i / tx_channels_out).copied().unwrap_or(0.0);
-                            *s = (mono * 32767.0) as i16;
-                        }
-                        off.store(o + n / tx_channels_out, Ordering::SeqCst);
-                        if o + n / tx_channels_out >= a.len() { dn.store(true, Ordering::SeqCst); }
-                    },
-                    |err| eprintln!("TX error: {}", err),
-                    None,
-                )?
-            }
-        }
+        )?
     };
     tx_stream.play()?;
-    let _ = audio_keep; // keep alive
 
-    // RX
     let rx_buf: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
-    let rx_buf_tx = rx_buf.clone();
     let rx_buf_rx = rx_buf.clone();
 
     let rx_stream: cpal::Stream = {
-        let buf = rx_buf_tx.clone();
-        let result = rx_device.build_input_stream::<f32, _, _>(
+        let buf = rx_buf_rx.clone();
+        rx_device.build_input_stream::<f32, _, _>(
             rx_config,
             move |data: &[f32], _info: &cpal::InputCallbackInfo| {
                 if let Ok(mut b) = buf.lock() {
@@ -340,26 +252,7 @@ fn ota_loopback(
             },
             |err| eprintln!("RX error: {}", err),
             None,
-        );
-        match result {
-            Ok(s) => s,
-            Err(_) => {
-                eprintln!("  F32 RX failed, trying I16...");
-                let buf = rx_buf_rx.clone();
-                rx_device.build_input_stream::<i16, _, _>(
-                    rx_config,
-                    move |data: &[i16], _info: &cpal::InputCallbackInfo| {
-                        if let Ok(mut b) = buf.lock() {
-                            for &s in data {
-                                b.push(s as f32 / 32768.0);
-                            }
-                        }
-                    },
-                    |err| eprintln!("RX error: {}", err),
-                    None,
-                )?
-            }
-        }
+        )?
     };
     rx_stream.play()?;
 

@@ -115,13 +115,8 @@ fn tx_mode(config: &Config, file: &PathBuf, device_name: Option<&str>) -> anyhow
     let mut modulator = sosw_core::OfdmModulator::new(config);
     let audio = modulator.modulate_with_preamble(&data);
     let audio_len = audio.len();
-    let sample_rate = config.sample_rate;
 
-    let config_out = cpal::StreamConfig {
-        channels: 1,
-        sample_rate,
-        buffer_size: cpal::BufferSize::Default,
-    };
+    let config_out = device.default_output_config()?.config();
 
     let stream = device.build_output_stream(
         config_out,
@@ -135,7 +130,7 @@ fn tx_mode(config: &Config, file: &PathBuf, device_name: Option<&str>) -> anyhow
     )?;
 
     stream.play()?;
-    let duration_ms = (audio_len as f64 / sample_rate as f64) * 1000.0;
+    let duration_ms = (audio_len as f64 / config.sample_rate as f64) * 1000.0;
     std::thread::sleep(std::time::Duration::from_millis(duration_ms as u64 + 500));
     eprintln!("TX done ({} ms)", duration_ms as u64);
     Ok(())
@@ -148,17 +143,10 @@ fn rx_mode(config: &Config, count: usize, device_name: Option<&str>, output: Opt
     };
     eprintln!("RX device: {}", device_label(&device));
 
-    let sample_rate = config.sample_rate;
-    let frames_per_buffer = config.symbol_duration_samples();
-
     let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<f32>::new()));
     let buf_clone = buf.clone();
 
-    let config_in = cpal::StreamConfig {
-        channels: 1,
-        sample_rate,
-        buffer_size: cpal::BufferSize::Fixed(frames_per_buffer as u32),
-    };
+    let config_in = device.default_input_config()?.config();
 
     let stream = device.build_input_stream(
         config_in,
@@ -217,17 +205,10 @@ fn test_mode(config: &Config, duration_secs: f64, device_name: Option<&str>) -> 
     };
     eprintln!("Test mode on device: {} for {:.1}s", device_label(&device), duration_secs);
 
-    let sample_rate = config.sample_rate;
-    let frames_per_buffer = config.symbol_duration_samples();
-
     let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<f32>::new()));
     let buf_clone = buf.clone();
 
-    let config_in = cpal::StreamConfig {
-        channels: 1,
-        sample_rate,
-        buffer_size: cpal::BufferSize::Fixed(frames_per_buffer as u32),
-    };
+    let config_in = device.default_input_config()?.config();
 
     let stream = device.build_input_stream(
         config_in,

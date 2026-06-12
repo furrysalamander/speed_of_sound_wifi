@@ -6,8 +6,8 @@
     <title>Speed of Sound WiFi</title>
     
 <script type="module">
-import init, * as bindings from '/sosw-web-c6d508048b9aa99.js';
-const wasm = await init({ module_or_path: '/sosw-web-c6d508048b9aa99_bg.wasm' });
+import init, * as bindings from '/sosw-web-52a9ac7a1319627f.js';
+const wasm = await init({ module_or_path: '/sosw-web-52a9ac7a1319627f_bg.wasm' });
 
 
 window.wasmBindings = bindings;
@@ -36,7 +36,7 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
         select, input { background: #222; color: #eee; border: 1px solid #444; padding: 0.4rem; border-radius: 4px; }
         .row { display: flex; gap: 0.5rem; align-items: center; margin: 0.5rem 0; flex-wrap: wrap; }
     </style>
-<link rel="modulepreload" href="/sosw-web-c6d508048b9aa99.js" crossorigin="anonymous" integrity="sha384-NpWxedE2xBoH4dJFVF1r0+eVRJtuQmAdZrlCBlebP6cdVRNkbv4zevoKlxbG2y7S"><link rel="preload" href="/sosw-web-c6d508048b9aa99_bg.wasm" crossorigin="anonymous" integrity="sha384-JhjCUe7jxMs5HrOhCHR4MzhqvZr817Bt4vw6Le99JKxHd/2TqGurJ7KSI0gWrQu9" as="fetch" type="application/wasm"></head>
+<link rel="modulepreload" href="/sosw-web-52a9ac7a1319627f.js" crossorigin="anonymous" integrity="sha384-iQgkaknpwqt2CGrmweRe+efo8vCdTHb+vNvzNuFWqVXt/LdHkO1nODE6YieDpuT0"><link rel="preload" href="/sosw-web-52a9ac7a1319627f_bg.wasm" crossorigin="anonymous" integrity="sha384-WcdVhYqE9HOxDqk0p1O37qtpNgovB4NeUm7F8FKwswdmcyofGNkLo0jM/dBchKBv" as="fetch" type="application/wasm"></head>
 <body>
     <div id="app"></div>
 </body>

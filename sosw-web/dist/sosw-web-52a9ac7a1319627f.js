@@ -579,9 +579,6 @@ function __wbg_get_imports() {
         __wbg_set_onaudioprocess_78b4bee256117d02: function(arg0, arg1) {
             arg0.onaudioprocess = arg1;
         },
-        __wbg_set_onended_e3d28cf884bd3d2c: function(arg0, arg1) {
-            arg0.onended = arg1;
-        },
         __wbg_set_onloadend_6acd23ad3737e17c: function(arg0, arg1) {
             arg0.onloadend = arg1;
         },
@@ -645,7 +642,7 @@ function __wbg_get_imports() {
             return ret;
         },
         __wbindgen_cast_0000000000000003: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("AudioProcessingEvent")], shim_idx: 511, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("AudioProcessingEvent")], shim_idx: 488, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h97f64dd1921e0112);
             return ret;
         },
