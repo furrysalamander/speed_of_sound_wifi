@@ -3,6 +3,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
 mod audio;
+mod waterfall;
 
 #[wasm_bindgen(start)]
 pub fn main() {
@@ -78,6 +79,8 @@ fn RxPanel() -> impl IntoView {
     let last_cfo = RwSignal::new(0.0f32);
     let status = RwSignal::new(String::from("Ready"));
 
+    let waterfall_ref = std::rc::Rc::new(std::cell::RefCell::new(None::<waterfall::Waterfall>));
+
     let start_rx = move |_| {
         if running.get() {
             running.set(false);
@@ -86,11 +89,29 @@ fn RxPanel() -> impl IntoView {
         }
         running.set(true);
         status.set("Starting...".to_string());
+
+        let doc = web_sys::window().and_then(|w| w.document());
+        let canvas = doc.and_then(|d| d.get_element_by_id("waterfall"))
+            .and_then(|el| el.dyn_into::<web_sys::HtmlCanvasElement>().ok());
+
+        if let Some(c) = canvas {
+            *waterfall_ref.borrow_mut() = waterfall::Waterfall::new(c).ok();
+        }
+
+        let wf = waterfall_ref.clone();
         leptos::task::spawn_local(async move {
             match audio::start_rx().await {
                 Ok(mut rx) => {
                     status.set("Listening...".to_string());
                     while running.get() {
+                        let samples = rx.drain_samples();
+                        if !samples.is_empty() {
+                            if let Some(ref mut w) = *wf.borrow_mut() {
+                                let spec = waterfall::compute_spectrum(&samples, 256);
+                                w.push_spectrum(&spec);
+                                w.render();
+                            }
+                        }
                         if let Some(r) = rx.poll() {
                             frames.update(|n| *n += 1);
                             last_peak.set(r.preamble_peak);
@@ -131,7 +152,7 @@ fn RxPanel() -> impl IntoView {
                     <span class="val">{move || format!("{:.4}", last_cfo.get())}</span>
                 </div>
             </div>
-            <canvas height="200"></canvas>
+            <canvas id="waterfall" height="200" width="512"></canvas>
         </div>
     }
 }

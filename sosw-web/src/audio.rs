@@ -32,6 +32,10 @@ impl RxHandle {
         result
     }
 
+    pub fn drain_samples(&mut self) -> Vec<f32> {
+        self.buffer.borrow_mut().drain(..).collect()
+    }
+
     pub fn stop(self) {
         drop(self);
     }
