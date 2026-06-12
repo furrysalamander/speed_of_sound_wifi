@@ -3,9 +3,19 @@ name = "sosw-cli"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "sosw-cli"
+path = "src/main.rs"
+
+[[bin]]
+name = "ota-validate"
+path = "src/ota_validate.rs"
+
 [dependencies]
 sosw-core = { path = "../sosw-core" }
 clap = { version = "4", features = ["derive"] }
 cpal = "0.15"
 anyhow = "1"
 log = "0.4"
+rand = "0.9"
+rand_chacha = "0.9"

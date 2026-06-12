@@ -1,0 +1,360 @@
+//! OTA Validation: end-to-end audio loopback test.
+//!
+//! Generates test payload, modulates to audio, plays via speaker,
+//! captures via microphone, demodulates, and compares.
+//!
+//! Usage:
+//!   cargo run --bin ota-validate -- [--tx-device NAME] [--rx-device NAME] [--frames N] [--snr-db N]
+
+use clap::Parser;
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use sosw_core::config::Config;
+use sosw_core::physical::ofdm_demod::OfdmDemodulator;
+use sosw_core::physical::ofdm_mod::OfdmModulator;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+#[derive(Parser)]
+#[command(name = "ota-validate", about = "OTA validation: play OFDM audio, capture, verify")]
+struct Args {
+    #[arg(long, default_value = "default")]
+    tx_device: String,
+
+    #[arg(long, default_value = "default")]
+    rx_device: String,
+
+    #[arg(long, default_value_t = 68)]
+    frames: usize,
+
+    /// SNR in dB for optional software noise injection (negative = no noise)
+    #[arg(long, default_value_t = -1.0)]
+    snr_db: f32,
+}
+
+fn main() -> anyhow::Result<()> {
+    let args = Args::parse();
+    let config = Config::ofdm_default();
+    let payload_size = config.payload_size;
+    let n_frames = args.frames;
+
+    eprintln!("=== OTA Validation ===");
+    eprintln!("  Frames: {}", n_frames);
+    eprintln!("  Payload per frame: {} bytes", payload_size);
+    eprintln!("  Total payload: {} bytes", n_frames * payload_size);
+
+    // 1. Generate test payload
+    let payload: Vec<u8> = (0..n_frames * payload_size)
+        .map(|i| (i % 256) as u8)
+        .collect();
+
+    // 2. Modulate all frames
+    let mut modulator = OfdmModulator::new(&config);
+    let mut audio = Vec::new();
+    for chunk in payload.chunks(payload_size) {
+        let frame_audio = modulator.modulate_with_preamble(chunk);
+        audio.extend_from_slice(&frame_audio);
+    }
+    eprintln!("  Audio: {:.1}s ({} samples)", audio.len() as f64 / config.sample_rate as f64, audio.len());
+
+    // 3. Play and capture (if no software-only flag)
+    let received = if args.snr_db < 0.0 {
+        // Hardware OTA loopback
+        ota_loopback(&config, &audio, &args.tx_device, &args.rx_device, n_frames)?
+    } else {
+        // Software loopback with noise
+        software_loopback(&config, &audio, args.snr_db)?
+    };
+
+    // 4. Compare
+    eprintln!("\n=== Analysis ===");
+    let mut matching_frames = 0usize;
+    let fps = payload_size;
+    for i in 0..n_frames {
+        let start = i * fps;
+        let sent = &payload[start..start + fps];
+        let recv = if i * fps + fps <= received.len() {
+            &received[i * fps..i * fps + fps]
+        } else {
+            &[]
+        };
+        if recv == sent {
+            matching_frames += 1;
+        } else if i < 5 {
+            let xor: Vec<u8> = sent.iter().zip(recv.iter()).map(|(a, b)| a ^ b).collect();
+            let diff_count = sent.iter().zip(recv.iter()).filter(|(a, b)| a != b).count();
+            eprintln!("  Frame {}: {} / {} bytes differ (xor first 8: {:02x?})", i, diff_count, fps, &xor[..8.min(xor.len())]);
+        }
+    }
+
+    let pct = matching_frames as f64 / n_frames as f64 * 100.0;
+    eprintln!("  Frames matching: {}/{} = {:.1}%", matching_frames, n_frames, pct);
+
+    if pct >= 90.0 {
+        eprintln!("  Result: PASS (threshold >= 90%)");
+        Ok(())
+    } else {
+        eprintln!("  Result: FAIL (threshold >= 90%)");
+        std::process::exit(1)
+    }
+}
+
+fn supported_stream_config(
+    device: &cpal::Device,
+    desired_rate: u32,
+    desired_channels: u16,
+) -> Option<cpal::StreamConfig> {
+    // Check all supported configs and find the closest match
+    if let Ok(configs) = device.supported_input_configs() {
+        for cfg in configs {
+            let rate_range = cfg.min_sample_rate().0..=cfg.max_sample_rate().0;
+            let channels = cfg.channels();
+            if rate_range.contains(&desired_rate) && channels >= desired_channels {
+                return Some(cpal::StreamConfig {
+                    channels: desired_channels,
+                    sample_rate: cpal::SampleRate(desired_rate),
+                    buffer_size: cpal::BufferSize::Default,
+                });
+            }
+        }
+    }
+    if let Ok(configs) = device.supported_output_configs() {
+        for cfg in configs {
+            let rate_range = cfg.min_sample_rate().0..=cfg.max_sample_rate().0;
+            let channels = cfg.channels();
+            if rate_range.contains(&desired_rate) && channels >= desired_channels {
+                return Some(cpal::StreamConfig {
+                    channels: desired_channels,
+                    sample_rate: cpal::SampleRate(desired_rate),
+                    buffer_size: cpal::BufferSize::Default,
+                });
+            }
+        }
+    }
+    // Fallback: use the device's default config
+    device.default_output_config().ok().map(|c| c.config()).or_else(|| {
+        device.default_input_config().ok().map(|c| c.config())
+    })
+}
+
+fn ota_loopback(
+    config: &Config,
+    audio: &[f32],
+    tx_device_name: &str,
+    rx_device_name: &str,
+    n_frames: usize,
+) -> anyhow::Result<Vec<u8>> {
+    let host = cpal::default_host();
+
+    let tx_device = find_device(&host, tx_device_name, false)
+        .unwrap_or_else(|_| host.default_output_device().expect("no output device"));
+    let rx_device = find_device(&host, rx_device_name, true)
+        .unwrap_or_else(|_| host.default_input_device().expect("no input device"));
+
+    eprintln!("  TX device: {}", tx_device.name().unwrap_or("?".into()));
+    eprintln!("  RX device: {}", rx_device.name().unwrap_or("?".into()));
+
+    let sample_rate = config.sample_rate;
+
+    let tx_config = supported_stream_config(&tx_device, sample_rate, 1)
+        .unwrap_or(cpal::StreamConfig {
+            channels: 1,
+            sample_rate: cpal::SampleRate(sample_rate),
+            buffer_size: cpal::BufferSize::Default,
+        });
+    let rx_config = supported_stream_config(&rx_device, sample_rate, 1)
+        .unwrap_or(cpal::StreamConfig {
+            channels: 1,
+            sample_rate: cpal::SampleRate(sample_rate),
+            buffer_size: cpal::BufferSize::Default,
+        });
+
+    eprintln!("  TX config: {} Hz, {} ch", tx_config.sample_rate.0, tx_config.channels);
+    eprintln!("  RX config: {} Hz, {} ch", rx_config.sample_rate.0, rx_config.channels);
+
+    // Quick check: if TX and RX are the SAME device (loopback), warn about cable
+    let tx_name = tx_device.name().unwrap_or_default();
+    let rx_name = rx_device.name().unwrap_or_default();
+    if tx_name == rx_name {
+        eprintln!("  WARNING: TX and RX on same device — needs loopback cable");
+    } else {
+        eprintln!("  NOTE: TX on '{}', RX on '{}'", tx_name, rx_name);
+        eprintln!("  Ensure speaker is audible to the microphone!");
+    }
+
+    // RX buffer shared between callback and main thread
+    let rx_buf: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
+    let rx_buf_tx = rx_buf.clone();
+    let rx_buf_rx = rx_buf.clone();
+
+    // TX: play audio samples, track completion
+    let audio_arc = Arc::new(audio.to_vec());
+    let audio_tx = audio_arc.clone();
+    let tx_offset = Arc::new(AtomicUsize::new(0));
+    let tx_done = Arc::new(AtomicBool::new(false));
+    let tx_offset_cb = tx_offset.clone();
+    let tx_done_cb = tx_done.clone();
+
+    let tx_stream = tx_device.build_output_stream(
+        &tx_config,
+        move |data: &mut [f32], _info: &cpal::OutputCallbackInfo| {
+            let offset = tx_offset_cb.load(Ordering::SeqCst);
+            let remain = audio_tx.len().saturating_sub(offset);
+            let n = data.len().min(remain);
+            if n > 0 {
+                for (i, sample) in data.iter_mut().enumerate() {
+                    *sample = audio_tx.get(offset + i).copied().unwrap_or(0.0);
+                }
+                tx_offset_cb.store(offset + n, Ordering::SeqCst);
+                if offset + n >= audio_tx.len() {
+                    tx_done_cb.store(true, Ordering::SeqCst);
+                }
+            }
+        },
+        |err| eprintln!("TX error: {}", err),
+        None,
+    )?;
+
+    // RX: capture samples into shared buffer
+    let rx_stream = rx_device.build_input_stream(
+        &rx_config,
+        move |data: &[f32], _info: &cpal::InputCallbackInfo| {
+            if let Ok(mut buf) = rx_buf_tx.lock() {
+                buf.extend_from_slice(data);
+            }
+        },
+        |err| eprintln!("RX error: {}", err),
+        None,
+    )?;
+
+    // Start RX first, then TX (with small gap for sync)
+    rx_stream.play()?;
+    std::thread::sleep(Duration::from_millis(500));
+    tx_stream.play()?;
+
+    // Wait for TX to finish
+    let audio_dur = Duration::from_secs_f64(audio.len() as f64 / sample_rate as f64);
+    std::thread::sleep(audio_dur + Duration::from_secs(1));
+
+    // Wait until TX finishes or timeout
+    for _ in 0..100 {
+        if tx_done.load(Ordering::SeqCst) { break; }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    drop(tx_stream);
+    // Keep RX alive briefly to capture any trailing audio
+    std::thread::sleep(Duration::from_millis(500));
+    drop(rx_stream);
+
+    let captured = rx_buf_rx.lock().unwrap().clone();
+    eprintln!("  Captured: {:.1}s ({} samples)", captured.len() as f64 / sample_rate as f64, captured.len());
+
+    if captured.len() < config.preamble_samples() {
+        anyhow::bail!("Too little audio captured ({} samples, need >{})", captured.len(), config.preamble_samples());
+    }
+
+    // Demodulate
+    let mut demod = OfdmDemodulator::new(config);
+    let mut received_frames = Vec::new();
+    let mut search_pos = 0usize;
+
+    let bits_per_sym = config.active_subcarriers() * 2;
+    let data_syms = (config.payload_size * 8 + bits_per_sym - 1) / bits_per_sym;
+    let frame_len = (config.preamble_symbols + data_syms) * config.symbol_duration_samples();
+
+    for _ in 0..n_frames {
+        if search_pos >= captured.len() {
+            break;
+        }
+        let chunk_end = std::cmp::min(search_pos + frame_len, captured.len());
+        let mut padded: Vec<f32> = captured[search_pos..chunk_end].to_vec();
+        padded.extend(std::iter::repeat(0.0f32).take(config.symbol_duration_samples() * 6));
+
+        if let Some(result) = demod.process_samples(&padded) {
+            let n = result.bytes.len().min(config.payload_size);
+            received_frames.extend_from_slice(&result.bytes[..n]);
+        }
+        search_pos += frame_len;
+        demod.reset();
+    }
+
+    Ok(received_frames)
+}
+
+fn software_loopback(config: &Config, audio: &[f32], snr_db: f32) -> anyhow::Result<Vec<u8>> {
+    use rand::Rng;
+    use rand::SeedableRng;
+
+    let mut noisy = audio.to_vec();
+    if snr_db > 0.0 {
+        let signal_power: f32 = noisy.iter().map(|&s| s * s).sum::<f32>() / noisy.len() as f32;
+        let noise_std = (signal_power / 10.0f32.powf(snr_db / 10.0)).sqrt();
+        let mut rng = rand_chacha::ChaCha12Rng::seed_from_u64(42);
+        for s in noisy.iter_mut() {
+            let n: f32 = rng.random::<f32>() * 2.0 - 1.0;
+            *s += n * noise_std;
+        }
+        eprintln!("  Software SNR: {} dB (noise_std={:.6})", snr_db, noise_std);
+    }
+
+    let mut demod = OfdmDemodulator::new(config);
+    let mut received = Vec::new();
+
+    let bits_per_sym = config.active_subcarriers() * 2;
+    let data_syms = (config.payload_size * 8 + bits_per_sym - 1) / bits_per_sym;
+    let frame_len = (config.preamble_symbols + data_syms) * config.symbol_duration_samples();
+
+    for chunk_start in (0..noisy.len()).step_by(frame_len) {
+        if chunk_start + config.preamble_samples() > noisy.len() {
+            break;
+        }
+        let chunk_end = std::cmp::min(chunk_start + frame_len, noisy.len());
+        let mut padded: Vec<f32> = noisy[chunk_start..chunk_end].to_vec();
+        padded.extend(std::iter::repeat(0.0f32).take(config.symbol_duration_samples() * 4));
+
+        if let Some(result) = demod.process_samples(&padded) {
+            let n = result.bytes.len().min(config.payload_size);
+            received.extend_from_slice(&result.bytes[..n]);
+        }
+        demod.reset();
+    }
+
+    Ok(received)
+}
+
+fn find_device(host: &cpal::Host, name: &str, input: bool) -> anyhow::Result<cpal::Device> {
+    let devices: Vec<cpal::Device> = if input {
+        host.input_devices()?.collect()
+    } else {
+        host.output_devices()?.collect()
+    };
+
+    let lower = name.to_lowercase();
+
+    // Try exact match first
+    for device in &devices {
+        if let Ok(dn) = device.name() {
+            if dn.to_lowercase() == lower {
+                return Ok(device.clone());
+            }
+        }
+    }
+
+    // Then substring (whole name contains query, or vice versa)
+    for device in &devices {
+        if let Ok(dn) = device.name() {
+            let dn_lower = dn.to_lowercase();
+            if dn_lower.contains(&lower) || lower.contains(&dn_lower) {
+                return Ok(device.clone());
+            }
+        }
+    }
+
+    // Fall back to default
+    if input {
+        host.default_input_device().ok_or_else(|| anyhow::anyhow!("no input device matching '{}'", name))
+    } else {
+        host.default_output_device().ok_or_else(|| anyhow::anyhow!("no output device matching '{}'", name))
+    }
+}
