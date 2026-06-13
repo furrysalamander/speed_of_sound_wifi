@@ -1,5 +1,10 @@
 # Sonic WiFi — Ethernet over OFDM Audio
 
+> **Status: Implemented.** All modules (tap, phy, mac, fragment) are built and
+> integrated. CSMA/CA state machine runs with per-fragment ACK and exponential
+> backoff. Remaining work: real-world multi-node testing, RTS/CTS, echo
+> cancellation for full-duplex.
+
 ## Goal
 
 Bridge a Linux TAP interface to the OFDM audio modem (`sosw-core`), creating a
@@ -152,14 +157,17 @@ sosw-tap list-devices
 
 ## Implementation Order
 
-1. sosw-core: add `assemble_frame_with_type()` to FrameAssembler
-2. Crate scaffold: Cargo.toml, workspace membership, modules
-3. `tap.rs` — TAP open/configure, MAC address
-4. `phy.rs` — cpal streams, OFDM bridge, carrier sense
-5. `fragment.rs` — Split/join Ethernet frames
-6. `mac.rs` — CSMA/CA state machine
-7. `main.rs` — CLI entry point, wiring
-8. Build + fix
+1. ~~sosw-core: add `assemble_frame_with_type()` to FrameAssembler~~ (done)
+2. ~~Crate scaffold: Cargo.toml, workspace membership, modules~~ (done)
+3. ~~`tap.rs` — TAP open/configure, MAC address~~ (done)
+4. ~~`phy.rs` — cpal streams, OFDM bridge, carrier sense~~ (done)
+5. ~~`fragment.rs` — Split/join Ethernet frames~~ (done)
+6. ~~`mac.rs` — CSMA/CA state machine~~ (done)
+7. ~~`main.rs` — CLI entry point, wiring~~ (done)
+8. ~~Build + fix~~ (done)
+9. Multi-node real-world testing (next)
+10. RTS/CTS for hidden terminal problem
+11. Echo cancellation for full-duplex
 
 ## Known Limitations (v1)
 

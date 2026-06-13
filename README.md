@@ -1,188 +1,294 @@
 # Speed of Sound WiFi
 
-Acoustically coupled data transmission over audio with OFDM modulation.  
-**Rust** (OFDM) and **Python** (legacy M-FSK) implementations.
-
-## Rust WASM Web App
-
-The `sosw-web` crate provides a browser-based OFDM modem with:
-
-- **RX tab** — real-time audio capture, preamble detection, waterfall spectrogram
-- **TX tab** — file upload and transmission via AudioBufferSourceNode
-- **Debug tab** — config tuning, enhanced signal monitoring, loopback testing
-  - 5 preset configs: Default, High Baud, Robust, Ultrasonic, Ultrawide
-  - Subcarrier range sliders, FFT/CP presets, threshold/PLL controls
-  - Per-subcarrier channel magnitude bar chart
-  - Continuous test signal generation for cross-device RX testing
-  - Config persistence via localStorage
-
-```bash
-cd sosw-web && trunk serve   # Dev server
-cd sosw-web && trunk build --release   # Production build
-```
-
-See `sosw-web/src/` for source files (`debug.rs`, `presets.rs`, `rx.rs`, `tx.rs`, `audio.rs`, `waterfall.rs`).
+Acoustic OFDM data modem — transmit data through sound using a speaker and microphone. Pure Rust implementation with a Python legacy codebase for reference.
 
 ## Architecture
 
+4-crate workspace sharing the `sosw-core` OFDM modem library:
+
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  Application Layer: File Transfer Protocol                  │
-│  (FILE_REQ → FILE_ACK → DATA frames → FILE_COMPLETE)       │
-├─────────────────────────────────────────────────────────────┤
-│  Link Layer: Frame Protocol                                 │
-│  [SYNC 8B][HEADER 4B][PAYLOAD variable][FEC parity][CRC-32]│
-├─────────────────────────────────────────────────────────────┤
-│  Physical Layer: M-FSK Modulation/Demodulation              │
-│  2/4/8/16 tones across 200-18000 Hz                         │
-├─────────────────────────────────────────────────────────────┤
-│  Audio I/O: sounddevice (PortAudio/ALSA)                    │
-│  Full-duplex 48kHz mono, 256-sample buffers                 │
-└─────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│  Application: sosw-tap (Ethernet-over-sound, CSMA/CA MAC)    │
+│              sosw-web (browser modem, 3-tab Leptos app)      │
+│              sosw-cli (desktop TX/RX/test via cpal)          │
+├──────────────────────────────────────────────────────────────┤
+│  sosw-core:  OFDM Modem (no I/O)                             │
+│  ┌──────────┬──────────────┬──────────────────────────────┐  │
+│  │ physical │ link         │ config                        │  │
+│  │  qpsk    │  scrambler   │  5 presets, serde              │  │
+│  │  ofdm_mod│  crc         │  FFT/CP/SC/freq derivation    │  │
+│  │  ofdm_dem│  fec(RS)     │  symbol_rate, theoretical_bps  │  │
+│  │  preamble│  frame       │                                │  │
+│  └──────────┴──────────────┴──────────────────────────────┘  │
+├──────────────────────────────────────────────────────────────┤
+│  Audio: cpal (desktop)  /  Web Audio API (WASM)              │
+│  48 kHz mono, f32 samples                                     │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-## Features
+### Data Flow
 
-- **M-FSK Modulation**: Configurable 2/4/8/16 tones with phase-continuous generation
-- **Reed-Solomon FEC**: RS(255,223) codes, corrects up to 16 byte errors per block
-- **CRC-32 Integrity**: Checksum verification over FEC-encoded data
-- **Frame Synchronization**: 8-byte sync pattern with robust parser
-- **File Transfer Protocol**: Handshake, chunked transfer, verification
-- **Real-time Waterfall Displays**: GPU-accelerized spectrograms via PyQtGraph
-- **Adjustable Parameters**: Baud rate, M-FSK order, frequency range, FEC strength
-- **Dual Mode**: Combined (loopback) and separate TX/RX modes
+```
+TX: Bytes → Scramble(ChaCha12) → Pack bits → QPSK map(2 bits/sc)
+    → OFDM symbols (IFFT + CP + raised-cosine) → Preamble → Audio samples
 
-## Installation
+RX: Audio → Cross-correlation → Preamble detect
+    → Channel estimate + CFO estimate → Per-sym FFT
+    → Decision-directed phase tracking → Equalization
+    → QPSK demap → Unpack bits → Descramble → Bytes
+    → FrameParser (sync → RS(255,223) FEC → CRC-32 verify)
+```
+
+### Crate Map
+
+| Crate | Purpose | Key Dependencies |
+|-------|---------|-----------------|
+| `sosw-core` | Core modem library (no I/O) | `rustfft`, `ndarray`, `reed-solomon`, `serde` |
+| `sosw-cli` | Desktop CLI (TX/RX/test/ota-validate) | `sosw-core`, `clap`, `cpal` |
+| `sosw-web` | WASM browser app (RX/TX/Debug tabs) | `sosw-core`, `leptos`, `web-sys` |
+| `sosw-tap` | Ethernet-over-sound (CSMA/CA MAC) | `sosw-core`, `tappers`, `cpal`, `tokio` |
+
+## Config Presets
+
+All presets verified OTA: **100% RS-correctable** on 30-frame loopback runs (ALC1220 speaker → USB PnP mic).
+
+| Preset | FFT | CP | SC Range | Freq Range | Sym/s | Bitrate |
+|--------|-----|----|----------|------------|-------|---------|
+| Default | 256 | 32 | 10–69 | 1.9–12.9 kHz | 167 | 20.0 kbps |
+| High Baud | 128 | 16 | 4–31 | 1.5–11.6 kHz | 333 | 18.7 kbps |
+| Robust | 512 | 64 | 20–120 | 1.9–11.3 kHz | 83 | 16.8 kbps |
+| Ultrasonic | 256 | 32 | 80–120 | 15.0–22.5 kHz | 167 | 13.7 kbps |
+| Ultrawide | 256 | 16 | 5–110 | 0.9–20.6 kHz | 176 | 37.4 kbps |
+
+**QPSK modulation** (2 bits per active subcarrier). **RS(255,223)** FEC corrects up to `nsym/2` byte errors per block. **CRC-32** (Ethernet/ZIP polynomial) provides integrity verification. **ChaCha12 XOR scrambler** (seed=12345) whitens data to prevent DC bias and improve phase tracking.
+
+**Default payload size**: 442 bytes (2 RS blocks). Validated by software roundtrip across FFT sizes 128–512, CP lengths 16–64, subcarrier ranges 1–127.
+
+## Quick Start
 
 ```bash
-# Create virtual environment
-python -m venv .venv
-source .venv/bin/activate  # Linux/macOS
-# .venv\Scripts\activate   # Windows
+# Build everything
+cargo build
 
-# Install dependencies
-pip install -r requirements.txt
+# Core library tests
+cargo test -p sosw-core
+
+# CLI
+cargo run -p sosw-cli -- list-devices
+cargo run -p sosw-cli -- test -p default
+
+# WASM web app
+cd sosw-web && trunk serve          # dev server
+cd sosw-web && trunk build --release # production (output in dist/)
 ```
 
-### System Dependencies
+### Prerequisites
 
-- **Linux**: `apt install portaudio19-dev libasound-dev` (Debian/Ubuntu)
-- **macOS**: `brew install portaudio`
-- **Windows**: Included with sounddevice wheel
+- **CLI / TAP**: Rust toolchain, system audio (ALSA/PulseAudio/PipeWire). `libasound2-dev`, `libpulse-dev` on Debian/Ubuntu.
+- **WASM**: `trunk` (`cargo install trunk`), `wasm32-unknown-unknown` target (`rustup target add wasm32-unknown-unknown`).
+- **sosw-tap**: Linux only (TAP requires `CAP_NET_ADMIN`). Run as root or with capabilities: `sudo setcap cap_net_admin+ep target/release/sosw-tap`.
 
-## Usage
-
-### GUI Mode (Default)
+## CLI Usage
 
 ```bash
-python -m src.main
+# List audio devices
+sosw-cli list-devices
+
+# Transmit a file
+sosw-cli tx file.bin -p ultrawide -d "speaker-name"
+
+# Receive frames
+sosw-cli rx -n 100 -p robust -d "mic-name" -o output.bin
+
+# Monitor mode (decode what's in the air)
+sosw-cli test -t 30 -p default -d "mic-name"
 ```
 
-### Headless Mode (Testing)
+### OTA Validation
+
+Test your hardware with a preset:
 
 ```bash
-# Run with default config
-python -m src.main --headless
-
-# Specify audio devices
-python -m src.main --headless --input-device 1 --output-device 2
-
-# Custom baud rate and M-FSK
-python -m src.main --headless --baud-rate 2000 --m-fsk 8
+cargo run --release -p sosw-cli --bin ota-validate -- \
+    --preset ultrawide --frames 20 \
+    --tx-device "ALC1220" --rx-device "USB_PnP"
 ```
 
-### List Audio Devices
+All 5 presets verified at 100% RS-correctable (30 frames each) on ALC1220 speaker → USB PnP mic loopback.
+
+## Ethernet-over-Sound (`sosw-tap`)
+
+Bridges a Linux TAP interface to the OFDM audio modem. Shared-medium Ethernet with CSMA/CA — all devices communicate over sound.
+
+```
+Linux TCP/IP stack → TAP interface → sosw-tap → OFDM modem → Speakers/Mic
+```
+
+### Usage
 
 ```bash
-python -c "from src.audio.devices import list_devices; print(list_devices())"
+# Start a sonic Ethernet node
+sosw-tap serve \
+    --tap sosw0 \
+    --preset default \
+    --node-id 42 \
+    --tx-device "speaker" \
+    --rx-device "mic"
+
+# Assign IP and use
+sudo ip addr add 10.0.0.1/24 dev sosw0
+sudo ip link set sosw0 up
+ping 10.0.0.2
 ```
 
-## Configuration
+### MAC Layer
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `sample_rate` | 48000 | Audio sample rate (Hz) |
-| `baud_rate` | 1000 | Symbols per second |
-| `m_fsk` | 4 | Number of FSK tones (2/4/8/16) |
-| `freq_min` | 200 | Minimum frequency (Hz) |
-| `freq_max` | 18000 | Maximum frequency (Hz) |
-| `fec_nsym` | 32 | RS parity symbols (corrects up to nsym/2 errors) |
-| `payload_size` | 223 | Bytes per frame payload |
+- **CSMA/CA**: DIFS (300 ms), random backoff (4–64 slots × 60 ms), ACK timeout (700 ms)
+- **Fragmentation**: 1500-byte Ethernet frames split into 438-byte fragments (4 frags max), reassembled by (src_id, frame_id)
+- **Node addressing**: 1-byte node IDs (0–255), broadcast at MAC layer
 
-### Theoretical Throughput
+## WASM Web App
 
-```
-bits_per_symbol = log2(M_FSK)
-theoretical_bps = baud_rate × bits_per_symbol
+3-tab browser app built with Leptos:
 
-Examples:
-  1000 baud, M=4  → 2000 bps
-  2000 baud, M=8  → 6000 bps
-  5000 baud, M=16 → 20000 bps
-```
+| Tab | Features |
+|-----|----------|
+| **RX** | Real-time audio capture, preamble detection, waterfall spectrogram, frames/peak/CFO stats |
+| **TX** | File upload, OFDM modulation, AudioBuffer playback, progress bar |
+| **Debug** | Config tuning (5 presets + sliders), enhanced monitoring (CRC/FEC failures, per-subcarrier channel magnitude), loopback testing, config persistence via localStorage |
+
+Open `http://localhost:8080` after `trunk serve`. Grant microphone permission when prompted.
 
 ## Testing
 
 ```bash
-# Run all tests
+# Rust unit tests (66+ tests)
+cargo test -p sosw-core
+
+# Software parameter sweep (FFT 128–512, CP 16–64, SC 1–127)
+cargo test -p sosw-core --test param_sweep -- --nocapture
+
+# OTA hardware validation
+cargo run --release -p sosw-cli --bin ota-validate -- --preset default --frames 20
+
+# Python tests (legacy)
 python -m pytest tests/ -v
-
-# Run specific test module
-python -m pytest tests/test_modulation.py -v
-
-# Run with coverage
-python -m pytest tests/ -v --cov=src --cov-report=term-missing
 ```
+
+### Test Coverage
+
+| Module | Tests | Description |
+|--------|-------|-------------|
+| `crc_tests` | 9 | CRC-32 encode/verify/corruption |
+| `scrambler_tests` | 9 | ChaCha12 XOR, determinism, edge cases |
+| `fec_tests` | 5 | RS(255,223) encode/decode |
+| `fec_extended_tests` | 8 | Multi-block, error injection, edge cases |
+| `framing_tests` | 5 | Frame assemble/parse roundtrip |
+| `framing_extended_tests` | 20 | Multi-frame, corruption, edge cases |
+| `ofdm_roundtrip` | 4 | Modulator→Demodulator roundtrip |
+| `param_sweep` | 4 | Software sweep across parameter ranges |
+| `debug_fft` | 1 | FFT sanity check |
+| `debug_preamble` | 1 | Preamble cross-correlation |
+| `fragment` | 6 | sosw-tap Ethernet fragmentation tests |
+| **Total** | **72** | |
 
 ## Project Structure
 
 ```
 speed_of_sound_wifi/
-├── src/
-│   ├── config.py          # Master configuration
-│   ├── main.py            # Entry point (GUI + headless)
-│   ├── audio/
-│   │   ├── io.py          # Audio stream management
-│   │   └── devices.py     # Device enumeration
-│   ├── physical/
-│   │   ├── modulator.py   # M-FSK modulation
-│   │   └── demodulator.py # M-FSK demodulation (FFT-based)
-│   ├── link/
-│   │   ├── fec.py         # Reed-Solomon FEC
-│   │   ├── crc.py         # CRC-32 utilities
-│   │   └── framing.py     # Frame assembly/parsing
-│   ├── application/
-│   │   ├── protocol.py    # File transfer protocol
-│   │   └── fileio.py      # File I/O utilities
-│   └── ui/
-│       ├── main_window.py # Main application window
-│       ├── waterfall.py   # Real-time waterfall display
-│       └── controls.py    # UI controls and stats
-├── tests/
-│   ├── test_modulation.py # Physical layer tests
-│   ├── test_fec.py        # FEC encoder/decoder tests
-│   └── test_framing.py    # Frame protocol tests
-├── requirements.txt
-└── README.md
+├── Cargo.toml              # Workspace root (4 members)
+├── README.md
+├── AGENTS.md               # Development guide
+├── PLAN.md                 # sosw-tap design document
+├── docs/
+│   └── frequency_sweep.md  # Hardware frequency sweep analysis
+│
+├── sosw-core/              # Core OFDM modem library (no I/O)
+│   ├── Cargo.toml
+│   └── src/
+│       ├── lib.rs          # Modulator/Demodulator traits, bit helpers
+│       ├── config.rs       # Config + 5 presets + frequency derivations
+│       ├── physical/
+│       │   ├── qpsk.rs         # Gray-coded QPSK map/demap
+│       │   ├── preamble.rs     # Preamble gen (seed=42), cross-correlation
+│       │   ├── ofdm_mod.rs     # IFFT, CP, raised-cosine, normalization
+│       │   └── ofdm_demod.rs   # Timing, channel est, DD phase tracking, CFO
+│       └── link/
+│           ├── scrambler.rs    # ChaCha12 XOR (seed=12345)
+│           ├── crc.rs          # CRC-32 (Ethernet/ZIP polynomial)
+│           ├── fec.rs          # RS(255,223) via reed-solomon crate
+│           └── frame.rs        # FrameAssembler, FrameParser (sync+RS+CRC)
+│
+├── sosw-cli/               # Desktop CLI (cpal audio)
+│   ├── Cargo.toml
+│   └── src/
+│       ├── main.rs         # CLI: list-devices, tx, rx, test
+│       └── ota_validate.rs # OTA validation binary
+│
+├── sosw-web/               # WASM web app (Leptos)
+│   ├── Cargo.toml
+│   ├── index.html
+│   └── src/
+│       ├── lib.rs          # App shell with 3 tabs
+│       ├── rx.rs           # RX panel (capture, waterfall, stats)
+│       ├── tx.rs           # TX panel (file upload, playback)
+│       ├── debug.rs        # Debug tab (config, monitor, loopback)
+│       ├── audio.rs        # AudioWorklet RX, AudioBuffer TX
+│       ├── waterfall.rs    # Real-time spectrogram + freq axis
+│       └── presets.rs      # Presets + localStorage persistence
+│
+├── sosw-tap/               # Ethernet-over-sound
+│   ├── Cargo.toml
+│   └── src/
+│       ├── lib.rs          # Module declarations
+│       ├── main.rs         # CLI: serve, list-devices
+│       ├── tap.rs          # TAP device wrapper (tappers crate)
+│       ├── phy.rs          # Audio I/O + OFDM modem bridge
+│       ├── mac.rs          # CSMA/CA state machine
+│       └── fragment.rs     # Ethernet fragmentation/reassembly
+│
+├── src/                    # Legacy Python implementation (M-FSK)
+│   ├── config.py
+│   ├── main.py
+│   ├── audio/              # Audio I/O (sounddevice/PortAudio)
+│   ├── physical/           # M-FSK modulator/demodulator, OFDM
+│   ├── link/               # CRC, FEC, framing
+│   ├── application/        # File transfer protocol
+│   └── ui/                 # PyQtGraph GUI (legacy)
+│
+├── examples/               # Python example scripts
+├── tests/                  # Python tests
+├── pyproject.toml
+└── requirements.txt
 ```
 
-## Testing Baud Rate Limits
+## Legacy Python Implementation
 
-The primary goal is to find the maximum baud rate before link failure:
+The `src/` directory contains the original Python implementation (M-FSK modulation, PyQtGraph GUI, file transfer protocol). This codebase is preserved for reference but is no longer the active development target. The Rust OFDM implementation in `sosw-core` is the canonical modem.
 
-1. Start with loopback cable (audio out → mic in)
-2. Set initial baud rate (e.g., 1000)
-3. Transfer a test file
-4. Increase baud rate incrementally
-5. Monitor error rate and FEC corrections in the stats display
-6. Note the baud rate where errors become uncorrectable
+```bash
+# Python setup
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
 
-Factors affecting maximum baud rate:
-- **Loopback cable**: Cleanest path, highest achievable baud rate
-- **Speaker/microphone**: Room acoustics, distance, ambient noise
-- **M-FSK order**: Higher M = more bits/symbol but closer frequency spacing
-- **FEC strength**: More parity bytes = more error correction overhead
-- **Sample rate**: Higher sample rate = finer frequency resolution
+# GUI mode
+python -m src.main
+
+# Headless loopback test
+python -m src.main --headless
+
+# Python unit tests
+python -m pytest tests/ -v
+```
+
+Python config parameters (historical):
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `sample_rate` | 48000 | Audio sample rate (Hz) |
+| `baud_rate` | 1000 | M-FSK symbols per second |
+| `m_fsk` | 4 | FSK tones (2/4/8/16) |
+| `fec_nsym` | 32 | RS parity symbols |
 
 ## License
 

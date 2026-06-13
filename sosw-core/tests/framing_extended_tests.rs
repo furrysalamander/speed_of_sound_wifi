@@ -236,16 +236,16 @@ fn test_frame_sync_partially_corrupted() {
     frame[2] = 0x00;
     frame[4] = 0x00;
 
-    // find_sync scans bytes; at offset 0 with the pattern above:
-    // [0]=00≠AA, [1]=55=55, [2]=00≠AA, [3]=55=55, [4]=00≠AA, [5]=55=55, [6]=AA=AA, [7]=55=55
+    // find_sync: [0]=00≠AA, [1]=55=55, [2]=00≠AA, [3]=55=55, [4]=00≠AA, [5]=55=55, [6]=AA=AA, [7]=55=55
     // → 5 matches ≥ 4 → sync at 0
-    // BUT: CRC covers (SYNC + FEC_ENCODED). Since SYNC bytes are corrupted,
-    // CRC check on raw data fails, and FEC recovery also fails (re-encoded CRC
-    // with corrupted SYNC prefix won't match stored CRC).
-    // So the frame is NOT recoverable with sync corrupted — this is expected.
+    // CRC on raw data fails (sync bytes corrupted), so try_extract_frame falls
+    // through to the FEC+re-encode path, which uses known SYNC_PATTERN (not the
+    // corrupted buffer bytes) — so CRC re-check passes and the frame IS recovered.
 
     let frames = parser.feed_bytes(&frame);
-    assert_eq!(frames.len(), 0, "sync corruption invalidates CRC → frame should NOT be parsed");
+    assert_eq!(frames.len(), 1, "FEC recovery should succeed with known SYNC_PATTERN re-encode");
+    assert!(frames[0].valid, "frame should be valid after FEC recovery");
+    assert_eq!(&frames[0].payload[..payload.len()], &payload[..], "payload should match");
 }
 
 #[test]

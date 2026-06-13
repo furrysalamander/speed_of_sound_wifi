@@ -6,6 +6,7 @@
 sosw-core/     — Core library (no I/O deps)
 sosw-cli/      — Desktop CLI (cpal audio)
 sosw-web/      — WASM web demo (Leptos)
+sosw-tap/      — Ethernet-over-sound (CSMA/CA MAC)
 ```
 
 ## Build & Test
@@ -22,6 +23,10 @@ cargo run -p sosw-cli -- --help
 # Web (WASM)
 cd sosw-web && trunk serve
 cd sosw-web && trunk build --release
+
+# TAP (Linux Ethernet-over-sound)
+cargo build -p sosw-tap
+cargo run -p sosw-tap -- serve --tap sosw0 --preset default
 ```
 
 ## Core Library (`sosw-core`)
@@ -39,6 +44,16 @@ cd sosw-web && trunk build --release
 | Frame | `src/link/frame.rs` | FrameAssembler, FrameParser (sync + RS + CRC) |
 | Traits | `src/lib.rs` | Modulator, Demodulator traits |
 
+## TAP Crate (`sosw-tap`)
+
+| Module | File | Purpose |
+|--------|------|---------|
+| CLI | `src/main.rs` | CLI: `serve`, `list-devices` |
+| TAP | `src/tap.rs` | TAP device wrapper (tappers crate) |
+| PHY | `src/phy.rs` | Audio I/O + OFDM modem bridge |
+| MAC | `src/mac.rs` | CSMA/CA state machine |
+| Fragment | `src/fragment.rs` | Ethernet fragmentation/reassembly |
+
 ## WASM Web App (`sosw-web`)
 
 | File | Purpose |
@@ -54,17 +69,18 @@ cd sosw-web && trunk build --release
 ## Test Results
 
 ```bash
-tests/fec_tests.rs ................ 5 passed
-tests/framing_tests.rs ............ 5 passed
-tests/ofdm_roundtrip.rs ........... 4 passed
 tests/crc_tests.rs ............... 9 passed
 tests/scrambler_tests.rs ......... 9 passed
-tests/fec_extended_tests.rs ...... 8 passed
-tests/framing_extended_tests.py .. 20 passed
-tests/param_sweep.rs ............. 4 passed  (software sweep: FFT 128-512, CP 16-64, SC 1-127)
-tests/debug_fft.rs ............... 1 passed
-tests/debug_preamble.rs .......... 1 passed
-Total: 66 tests  (plus OTA: 600/600 frames, 5 presets × 120 frames, 100% RS-correctable)
+tests/fec_tests.rs ............... 5 passed
+tests/fec_extended_tests.rs ..... 8 passed
+tests/framing_tests.rs ........... 5 passed
+tests/framing_extended_tests.rs . 20 passed
+tests/ofdm_roundtrip.rs .......... 4 passed
+tests/param_sweep.rs ............ 4 passed  (software sweep: FFT 128-512, CP 16-64, SC 1-127)
+tests/debug_fft.rs .............. 1 passed
+tests/debug_preamble.rs ......... 1 passed
+Fragment tests (sosw-tap) ....... 6 passed
+Total: 72 tests  (plus OTA: 600/600 frames, 5 presets × 120 frames, 100% RS-correctable)
 ```
 
 ## Config Presets
@@ -116,24 +132,6 @@ All 5 presets verified with OTA loopback — **100% RS-correctable** on 30-frame
 - **Chunk margin**: `frame_samples + 6×guard` ensures first frame's preamble offset (~1440 samples / 30ms audio latency) doesn't truncate data symbols
 
 Run your own sweep: `cargo run --release -p sosw-cli --bin ota-validate -- --preset <name> --frames 20 --tx-device <tx> --rx-device <rx>`
-
-### OTA Throughput Analysis
-
-| Preset | PHY Rate | Frame Size | Frame Dur | Ethernet Goodput (est.) |
-|--------|----------|------------|-----------|------------------------|
-| Ultrawide | 37.4 kbps | 442 B | 159 ms | ~2 kbps |
-| High Baud | 18.7 kbps | 128 B | 141 ms | ~2 kbps |
-
-MAC timings (300 ms DIFS, 60 ms slots, 700 ms ACK timeout) are the real bottleneck, not PHY capacity. Round-trip audio path latency through PipeWire (Ubuntu defaults, quantum=1024, BufferSize=Fixed(256)) is ~47ms.
-
-## Next Steps
-
-1. ~~**CLI crate**: cpal audio I/O for desktop TX/RX testing~~ (done)
-2. ~~**WASM crate**: Leptos web app with AudioWorklet~~ (done: RX, TX, Debug tabs)
-3. ~~**OTA validation**: Rust OTA matches Python baseline; all 5 presets verified~~ (done)
-4. ~~**Phy API loopback**: All 5 presets verified through persistent cpal streams~~ (done)
-5. **sosw-tap**: Ethernet-over-sound with CSMA/CA MAC
-6. **WASM cross-device testing**: Validate ultrasonic presets with high-frequency hardware
 
 ## Data Flow
 

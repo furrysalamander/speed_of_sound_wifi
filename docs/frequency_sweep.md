@@ -1,14 +1,26 @@
 # Frequency Sweep Analysis
 
-## Software Sweep
+## Software Sweep (Rust)
 
-Run: `cargo test -p sosw-core --test param_sweep -- --nocapture`
+```bash
+cargo test -p sosw-core --test param_sweep -- --nocapture
+```
 
 The modem works correctly in software across **all** tested parameter combinations up to the Nyquist limit (24 kHz). Software is not the bottleneck.
 
-## Over-the-Air Sweep (Real Hardware)
+## OTA Preset Validation (Rust)
 
-Run: `python -m examples.ota_freq_sweep --frames 10`
+```bash
+cargo run --release -p sosw-cli --bin ota-validate -- --preset <name> --frames 20 --tx-device <tx> --rx-device <rx>
+```
+
+All 5 presets verified at **100% RS-correctable** on 30-frame OTA loopback runs (ALC1220 speaker → USB PnP mic). See `AGENTS.md` for detailed results.
+
+## Over-the-Air Sweep (Python)
+
+```bash
+python -m examples.ota_freq_sweep --frames 10
+```
 
 **Setup:**
 - TX: onboard analog speaker output (`ALC1220 Analog`)
