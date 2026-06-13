@@ -46,11 +46,15 @@ fn App() -> impl IntoView {
                     on:click=move |_| tab.set(Tab::Debug)
                 >"Debug"</button>
             </div>
-            {move || match tab.get() {
-                Tab::Rx => view! { <rx::RxPanel /> }.into_any(),
-                Tab::Tx => view! { <tx::TxPanel /> }.into_any(),
-                Tab::Debug => view! { <debug::DebugPanel /> }.into_any(),
-            }}
+            <div style:display=move || if tab.get() == Tab::Rx { "block" } else { "none" }>
+                <rx::RxPanel />
+            </div>
+            <div style:display=move || if tab.get() == Tab::Tx { "block" } else { "none" }>
+                <tx::TxPanel />
+            </div>
+            <div style:display=move || if tab.get() == Tab::Debug { "block" } else { "none" }>
+                <debug::DebugPanel />
+            </div>
         </div>
     }
 }

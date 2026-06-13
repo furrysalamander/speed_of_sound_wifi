@@ -36,8 +36,8 @@ pub fn RxPanel() -> impl IntoView {
             match audio::start_rx(&config).await {
                 Ok(mut rx) => {
                     status.set("Listening...".to_string());
-                    while running.get() {
-                        let samples = rx.drain_samples();
+                    while running.get_untracked() {
+                        let (samples, result_opt) = rx.poll();
                         if !samples.is_empty() {
                             if let Some(ref mut w) = *wf.borrow_mut() {
                                 let spec = crate::waterfall::compute_spectrum(&samples, 256);
@@ -45,11 +45,11 @@ pub fn RxPanel() -> impl IntoView {
                                 w.render();
                             }
                         }
-                        if let Some(r) = rx.poll() {
+                        if let Some(r) = result_opt {
                             frames.update(|n| *n += 1);
                             last_peak.set(r.preamble_peak);
                             last_cfo.set(r.cfo_rad_per_sym);
-                            status.set(format!("Frame {}", frames.get()));
+                            status.set(format!("Frame {}", frames.get_untracked()));
                         }
                         gloo_timers::future::sleep(std::time::Duration::from_millis(50)).await;
                     }
@@ -66,10 +66,10 @@ pub fn RxPanel() -> impl IntoView {
     view! {
         <div class="panel">
             <div class="row">
-                <button on:click=start_rx>
+                <button class="btn" class:btn-stop=move || running.get() on:click=start_rx>
                     {move || if running.get() { "Stop RX" } else { "Start RX" }}
                 </button>
-                <span>{move || status.get()}</span>
+                <span class="status">{move || status.get()}</span>
             </div>
             <div class="stats">
                 <div class="stat">

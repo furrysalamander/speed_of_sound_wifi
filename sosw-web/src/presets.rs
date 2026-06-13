@@ -2,6 +2,7 @@ use sosw_core::Config;
 
 pub struct Preset {
     pub name: &'static str,
+    #[allow(dead_code)]
     pub description: &'static str,
     pub maker: fn() -> Config,
 }

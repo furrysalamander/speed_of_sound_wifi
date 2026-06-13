@@ -15,7 +15,8 @@ pub fn DebugPanel() -> impl IntoView {
     let config = RwSignal::new(presets::load_saved_config());
     let rx_running = RwSignal::new(false);
     let tx_active = RwSignal::new(false);
-    let status = RwSignal::new(String::from("Ready"));
+    let rx_status = RwSignal::new(String::from("Ready"));
+    let tx_status = RwSignal::new(String::from("Ready"));
 
     // Stats
     let frames_total = RwSignal::new(0u32);
@@ -51,12 +52,12 @@ pub fn DebugPanel() -> impl IntoView {
                 fec_fails
                 frame_rate
                 per_sc
-                status
+                rx_status
             />
             <LoopbackSection
                 config
                 tx_active
-                status
+                tx_status
             />
         </div>
     }
@@ -133,8 +134,6 @@ fn ConfigSection(
                 preset_name, f_min, f_max, c.active_subcarriers(), sym_rate, bps)
     };
 
-    let sc_min_str = move || config.get().sc_min.to_string();
-    let sc_max_str = move || config.get().sc_max.to_string();
     let sc_max_limit = move || (config.get().fft_size / 2 - 1).to_string();
     let thresh_str = move || format!("{:.2}", config.get().preamble_threshold);
     let amp_str = move || format!("{:.2}", config.get().output_amplitude);
@@ -151,8 +150,8 @@ fn ConfigSection(
                     let name = p.name;
                     view! {
                         <button
+                            class="btn small"
                             on:click=move |_| apply_preset(maker)
-                            style="font-size:0.8rem;padding:2px 8px;"
                         >
                             {name}
                         </button>
@@ -160,13 +159,19 @@ fn ConfigSection(
                 }).collect::<Vec<_>>()}
             </div>
             <div class="row">
-                <label style="font-size:0.8rem;min-width:60px;">"SC min"</label>
-                <input type="range" min="1" max="255" value=sc_min_str
+                <label style="font-size:0.8rem;min-width:60px;">
+                    "SC min: " {move || config.get().sc_min.to_string()}
+                </label>
+                <input type="range" min="1" max="255"
+                    prop:value=move || config.get().sc_min.to_string()
                     on:input=set_sc_min style="flex:1" />
             </div>
             <div class="row">
-                <label style="font-size:0.8rem;min-width:60px;">"SC max"</label>
-                <input type="range" min="2" max=sc_max_limit value=sc_max_str
+                <label style="font-size:0.8rem;min-width:60px;">
+                    "SC max: " {move || config.get().sc_max.to_string()}
+                </label>
+                <input type="range" min="2" max=sc_max_limit
+                    prop:value=move || config.get().sc_max.to_string()
                     on:input=set_sc_max style="flex:1" />
             </div>
             <div class="row" style="gap:4px;">
@@ -175,9 +180,9 @@ fn ConfigSection(
                     let active = config.get().fft_size == v;
                     view! {
                         <button
+                            class="btn small"
+                            class:active=move || active
                             on:click=move |_| set_fft(v)
-                            style=format!("font-size:0.8rem;padding:2px 8px;{}",
-                                if active { "background:#4fc3f7;color:#111;" } else { "" })
                         >{v}</button>
                     }
                 }).collect::<Vec<_>>()}
@@ -186,26 +191,35 @@ fn ConfigSection(
                     let active = config.get().cp_length == v;
                     view! {
                         <button
+                            class="btn small"
+                            class:active=move || active
                             on:click=move |_| set_cp(v)
-                            style=format!("font-size:0.8rem;padding:2px 8px;{}",
-                                if active { "background:#4fc3f7;color:#111;" } else { "" })
                         >{v}</button>
                     }
                 }).collect::<Vec<_>>()}
             </div>
             <div class="row">
-                <label style="font-size:0.8rem;min-width:100px;">"Thresh: " {move || format!("{:.2}", config.get().preamble_threshold)}</label>
-                <input type="range" min="0.01" max="0.50" step="0.01" value=thresh_str
+                <label style="font-size:0.8rem;min-width:100px;">
+                    "Thresh: " {move || format!("{:.2}", config.get().preamble_threshold)}
+                </label>
+                <input type="range" min="0.01" max="0.50" step="0.01"
+                    prop:value=thresh_str
                     on:input=set_thresh style="flex:1" />
             </div>
             <div class="row">
-                <label style="font-size:0.8rem;min-width:100px;">"TX Amp: " {move || format!("{:.2}", config.get().output_amplitude)}</label>
-                <input type="range" min="0.01" max="1.00" step="0.01" value=amp_str
+                <label style="font-size:0.8rem;min-width:100px;">
+                    "TX Amp: " {move || format!("{:.2}", config.get().output_amplitude)}
+                </label>
+                <input type="range" min="0.01" max="1.00" step="0.01"
+                    prop:value=amp_str
                     on:input=set_amp style="flex:1" />
             </div>
             <div class="row">
-                <label style="font-size:0.8rem;min-width:100px;">"PLL β: " {move || format!("{:.2}", config.get().pll_beta)}</label>
-                <input type="range" min="0.01" max="0.50" step="0.01" value=pll_str
+                <label style="font-size:0.8rem;min-width:100px;">
+                    "PLL β: " {move || format!("{:.2}", config.get().pll_beta)}
+                </label>
+                <input type="range" min="0.01" max="0.50" step="0.01"
+                    prop:value=pll_str
                     on:input=set_pll style="flex:1" />
             </div>
             <div class="row">
@@ -231,20 +245,20 @@ fn MonitorSection(
     fec_fails: RwSignal<u32>,
     frame_rate: RwSignal<f32>,
     per_sc: RwSignal<Vec<f32>>,
-    status: RwSignal<String>,
+    rx_status: RwSignal<String>,
 ) -> impl IntoView {
     let wf_ref = std::rc::Rc::new(std::cell::RefCell::new(None::<waterfall::Waterfall>));
     let per_sc_canvas = std::rc::Rc::new(std::cell::RefCell::new(None::<web_sys::HtmlCanvasElement>));
 
     let start_stop = move |_| {
-        if rx_running.get() {
+        if rx_running.get_untracked() {
             rx_running.set(false);
-            status.set("Stopped".to_string());
+            rx_status.set("Stopped".to_string());
             return;
         }
 
         rx_running.set(true);
-        status.set("Starting...".to_string());
+        rx_status.set("Starting...".to_string());
 
         // Reset stats
         frames_total.set(0);
@@ -278,7 +292,7 @@ fn MonitorSection(
         let wf = wf_ref.clone();
         let psc_ref = per_sc_canvas.clone();
         let running = rx_running.clone();
-        let st = status.clone();
+        let st = rx_status.clone();
         let ft = frames_total.clone();
         let fv = frames_valid.clone();
         let fd = frames_dropped.clone();
@@ -306,9 +320,8 @@ fn MonitorSection(
                     let mut last_frame_time = wasm_bindgen::JsValue::NULL;
                     let mut frame_count_last = 0u32;
 
-                    while running.get() {
-                        // Waterfall
-                        let samples = rx.drain_samples();
+                    while running.get_untracked() {
+                        let (samples, result_opt) = rx.poll();
                         if !samples.is_empty() {
                             let mut wf_borrow = wf.borrow_mut();
                             if let Some(ref mut w) = *wf_borrow {
@@ -320,7 +333,7 @@ fn MonitorSection(
                         }
 
                         // Demodulate
-                        if let Some(result) = rx.poll() {
+                        if let Some(result) = result_opt {
                             ft.update(|n| *n += 1);
                             lp.set(result.preamble_peak);
                             lc.set(result.cfo_rad_per_sym);
@@ -345,18 +358,21 @@ fn MonitorSection(
                             if last_frame_time != wasm_bindgen::JsValue::NULL {
                                 let elapsed_s = (now - last_frame_time.as_f64().unwrap_or(0.0)) / 1000.0;
                                 if elapsed_s > 0.0 {
-                                    let rate_val = (ft.get() - frame_count_last) as f32 / elapsed_s as f32;
+                                    let rate_val = (ft.get_untracked() - frame_count_last) as f32 / elapsed_s as f32;
                                     fr.set(rate_val);
                                 }
                             }
                             last_frame_time = JsValue::from_f64(now);
-                            frame_count_last = ft.get();
+                            frame_count_last = ft.get_untracked();
 
-                            st.set(format!("Frame {}", ft.get()));
+                            st.set(format!("Frame {}", ft.get_untracked()));
                         }
 
                         // Draw per-subcarrier bar chart
-                        draw_per_sc_chart(&psc_ref, &ps.get(), &cfg);
+                        let h_values = ps.get_untracked();
+                        if !h_values.is_empty() {
+                            draw_per_sc_chart(&psc_ref, &h_values, &cfg);
+                        }
 
                         gloo_timers::future::sleep(std::time::Duration::from_millis(50)).await;
                     }
@@ -376,10 +392,14 @@ fn MonitorSection(
                 "RX Monitor"
             </summary>
             <div class="row">
-                <button on:click=start_stop>
+                <button
+                    class="btn"
+                    class:btn-stop=move || rx_running.get()
+                    on:click=start_stop
+                >
                     {move || if rx_running.get() { "Stop RX" } else { "Start RX" }}
                 </button>
-                <span>{move || status.get()}</span>
+                <span class="status">{move || rx_status.get()}</span>
             </div>
             <div class="stats" style="grid-template-columns:1fr 1fr 1fr;">
                 <div class="stat">
@@ -499,36 +519,41 @@ fn draw_per_sc_chart(
 fn LoopbackSection(
     config: RwSignal<Config>,
     tx_active: RwSignal<bool>,
-    status: RwSignal<String>,
+    tx_status: RwSignal<String>,
 ) -> impl IntoView {
     let frames_sent = RwSignal::new(0u32);
     let frames_received = RwSignal::new(0u32);
+    let tx_handle = std::rc::Rc::new(std::cell::RefCell::new(None::<audio::TxPlayback>));
 
+    let tx_handle_clone = tx_handle.clone();
     let start_test = move |_| {
-        if tx_active.get() {
+        if tx_active.get_untracked() {
             tx_active.set(false);
-            status.set("TX stopped".to_string());
+            tx_status.set("TX stopped".to_string());
+            *tx_handle_clone.borrow_mut() = None;
             return;
         }
 
         tx_active.set(true);
-        status.set("Starting test TX...".to_string());
+        tx_status.set("Starting test TX...".to_string());
 
         let cfg = config.get();
         let n_frames = 20usize;
         let total = n_frames as u32;
         frames_sent.set(total);
+        let txh = tx_handle_clone.clone();
 
         leptos::task::spawn_local(async move {
             let samples = audio::build_test_signal(&cfg, n_frames);
             let sample_rate = cfg.sample_rate as f32;
             let tx = audio::play_audio_looped(samples, sample_rate);
             match tx {
-                Ok(_) => {
-                    status.set(format!("TX: {} frames (looped)", total));
+                Ok(t) => {
+                    tx_status.set(format!("TX: {} frames (looped)", total));
+                    *txh.borrow_mut() = Some(t);
                 }
                 Err(e) => {
-                    status.set(format!("TX error: {:?}", e));
+                    tx_status.set(format!("TX error: {:?}", e));
                     tx_active.set(false);
                 }
             }
@@ -541,10 +566,14 @@ fn LoopbackSection(
                 "Test / Loopback"
             </summary>
             <div class="row">
-                <button on:click=start_test>
+                <button
+                    class="btn"
+                    class:btn-stop=move || tx_active.get()
+                    on:click=start_test
+                >
                     {move || if tx_active.get() { "Stop TX" } else { "Start Test TX" }}
                 </button>
-                <span>{move || status.get()}</span>
+                <span class="status">{move || tx_status.get()}</span>
             </div>
             <div class="stats" style="grid-template-columns:1fr 1fr;">
                 <div class="stat">

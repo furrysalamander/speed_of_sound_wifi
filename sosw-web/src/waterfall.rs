@@ -56,9 +56,9 @@ impl Waterfall {
         let w = self.width as usize;
         let h = self.height as usize;
 
-        if self.col >= w as u32 {
-            self.col = 0;
-        }
+        // Shift all rows down by 1 row
+        let row_bytes = w * 4;
+        self.buffer.copy_within(0..(h - 1) * row_bytes, row_bytes);
 
         // Compute the active band pixel range for overlay
         let (band_x_start, band_x_end) = if let (Some(sc_min), Some(sc_max), Some(fft_size)) =
@@ -73,8 +73,9 @@ impl Waterfall {
             (0, 0)
         };
 
-        for y in 0..h {
-            let idx = y * magnitudes.len() / h;
+        // Draw new spectrum at y = 0
+        for x in 0..w {
+            let idx = x * magnitudes.len() / w;
             let mag = magnitudes.get(idx).copied().unwrap_or(0.0);
 
             let db = 20.0 * mag.log10().max(-6.0).min(0.0);
@@ -82,7 +83,7 @@ impl Waterfall {
 
             let (r, g, b) = self.hot_colormap(normalized);
 
-            let buf_idx = (y * w + self.col as usize) * 4;
+            let buf_idx = x * 4;
             if buf_idx + 3 < self.buffer.len() {
                 self.buffer[buf_idx] = r;
                 self.buffer[buf_idx + 1] = g;
@@ -90,11 +91,9 @@ impl Waterfall {
                 self.buffer[buf_idx + 3] = 255;
             }
 
-            // Draw active band overlay on the current column
+            // Draw active band overlay
             if band_x_end > band_x_start {
-                let col = self.col as usize;
-                if col >= band_x_start && col < band_x_end {
-                    // Tint the active band pixels - add a subtle green tint
+                if x >= band_x_start && x < band_x_end {
                     let alpha_factor = 0.3;
                     let existing_r = r as f32;
                     let existing_g = g as f32;
@@ -110,8 +109,6 @@ impl Waterfall {
                 }
             }
         }
-
-        self.col += 1;
     }
 
     pub fn render(&mut self) {
