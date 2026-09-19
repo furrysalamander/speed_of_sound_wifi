@@ -12,6 +12,9 @@ struct Args {
     preset: String,
     #[arg(long)]
     device: Option<String>,
+    /// Linear gain applied to the modulated audio before playback
+    #[arg(short, long, default_value_t = 1.0)]
+    gain: f32,
 }
 
 fn main() -> Result<()> {
@@ -29,7 +32,15 @@ fn main() -> Result<()> {
     );
 
     let mut modulator = OfdmModulator::new(&config);
-    let audio = std::sync::Arc::new(modulator.modulate_with_preamble(&frame));
+    let mut audio = modulator.modulate_with_preamble(&frame);
+    if args.gain != 1.0 {
+        for s in audio.iter_mut() {
+            *s *= args.gain;
+        }
+    }
+    let peak = audio.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+    eprintln!("Gain {}x -> peak {:.3}", args.gain, peak);
+    let audio = std::sync::Arc::new(audio);
     let audio_len = audio.len();
 
     let host = cpal::default_host();

@@ -133,7 +133,9 @@ fn main() -> anyhow::Result<()> {
             } else {
                 &[]
             };
-            recv_raw.is_empty() || {
+            // A frame only counts as RS-correctable if the full payload was
+            // actually recovered; a missing/short frame is a failure, not a pass.
+            recv_raw.len() == payload_size && {
                 let diff = sent.iter().zip(recv_raw.iter()).filter(|(a, b)| a != b).count();
                 diff <= rs_byte_budget
             }
