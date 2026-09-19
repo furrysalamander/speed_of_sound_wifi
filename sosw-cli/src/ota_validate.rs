@@ -25,6 +25,12 @@ struct Args {
     preset: String,
     #[arg(long, default_value_t = 1.0)]
     gain: f32,
+    /// Dump captured mic audio as raw little-endian f32 for offline analysis
+    #[arg(long)]
+    dump_rx: Option<std::path::PathBuf>,
+    /// Dump generated TX audio as raw little-endian f32 for offline analysis
+    #[arg(long)]
+    dump_tx: Option<std::path::PathBuf>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -71,8 +77,17 @@ fn main() -> anyhow::Result<()> {
     eprintln!("  Audio: {:.1}s ({} samples, {} data+{}train frames, max={:.4} RMS={:.6}, gain={}x)",
               audio.len() as f64 / config.sample_rate as f64, audio.len(), n_frames, conv_frames, tx_max, tx_rms, tx_gain);
 
+    if let Some(path) = &args.dump_tx {
+        let mut bytes = Vec::with_capacity(audio.len() * 4);
+        for s in &audio {
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        std::fs::write(path, &bytes)?;
+        eprintln!("  Dumped raw TX ({} f32) to {}", audio.len(), path.display());
+    }
+
     let received = if args.snr_db < 0.0 {
-        ota_loopback(&config, &audio, &args.tx_device, &args.rx_device, n_frames + conv_frames)?
+        ota_loopback(&config, &audio, &args.tx_device, &args.rx_device, n_frames + conv_frames, args.dump_rx.as_deref())?
     } else {
         software_loopback(&config, &audio, args.snr_db)?
     };
@@ -220,6 +235,7 @@ fn ota_loopback(
     tx_device_name: &str,
     rx_device_name: &str,
     n_frames: usize,
+    dump_rx: Option<&std::path::Path>,
 ) -> anyhow::Result<Vec<u8>> {
     let host = cpal::default_host();
 
@@ -292,11 +308,19 @@ fn ota_loopback(
 
     let rx_stream: cpal::Stream = {
         let buf = rx_buf_rx.clone();
+        let rx_channels = rx_config.channels as usize;
         rx_device.build_input_stream::<f32, _, _>(
             rx_config,
             move |data: &[f32], _info: &cpal::InputCallbackInfo| {
                 if let Ok(mut b) = buf.lock() {
-                    b.extend_from_slice(data);
+                    if rx_channels > 1 {
+                        // Take the left channel only.
+                        for frame in data.chunks(rx_channels) {
+                            b.push(frame[0]);
+                        }
+                    } else {
+                        b.extend_from_slice(data);
+                    }
                 }
             },
             |err| eprintln!("RX error: {}", err),
@@ -324,6 +348,15 @@ fn ota_loopback(
     let rms = (captured.iter().map(|&s| s * s).sum::<f32>() / captured.len() as f32).sqrt();
     eprintln!("  Captured: {:.1}s ({} samples)", captured.len() as f64 / sample_rate as f64, captured.len());
     eprintln!("  Captured: max={:.4} RMS={:.6}", max_amp, rms);
+
+    if let Some(path) = dump_rx {
+        let mut bytes = Vec::with_capacity(captured.len() * 4);
+        for s in &captured {
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        std::fs::write(path, &bytes)?;
+        eprintln!("  Dumped raw RX ({} f32) to {}", captured.len(), path.display());
+    }
 
     if captured.len() < config.preamble_samples() {
         anyhow::bail!("Too little audio captured ({} samples, need >{})", captured.len(), config.preamble_samples());
@@ -385,15 +418,19 @@ fn software_loopback(config: &Config, audio: &[f32], snr_db: f32) -> anyhow::Res
     let mut demod = OfdmDemodulator::new(config);
     let mut received = Vec::new();
 
-    // skip initial silence, stride by full padded frame length
+    // skip initial silence, stride by full frame period. The transmitter emits
+    // `frame_samples` of audio followed by one `guard` symbol of silence, so the
+    // period is frame_samples + guard; using frame_samples alone drifts by one
+    // symbol per frame and progressively misaligns the demodulator.
     let lead_in = (config.sample_rate as f64 * 0.5) as usize;
-    let frame_len = config.frame_samples();
+    let guard = config.symbol_duration_samples();
+    let frame_period = config.frame_samples() + guard;
 
-    for chunk_start in (lead_in..noisy.len()).step_by(frame_len) {
+    for chunk_start in (lead_in..noisy.len()).step_by(frame_period) {
         if chunk_start + config.preamble_samples() > noisy.len() {
             break;
         }
-        let chunk_end = std::cmp::min(chunk_start + frame_len, noisy.len());
+        let chunk_end = std::cmp::min(chunk_start + frame_period, noisy.len());
         let mut padded: Vec<f32> = noisy[chunk_start..chunk_end].to_vec();
         padded.extend(std::iter::repeat(0.0f32).take(config.symbol_duration_samples() * 4));
 
