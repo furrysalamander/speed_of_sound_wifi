@@ -175,28 +175,36 @@ fn rx_mode(config: &Config, count: usize, device_name: Option<&str>, output: Opt
     stream.play()?;
 
     let mut demodulator = sosw_core::OfdmDemodulator::new(config);
+    let mut rx_batch: Vec<f32> = Vec::new();
     let mut received = Vec::new();
     let mut frames_decoded = 0usize;
+    let min_decode = config.preamble_samples() + config.data_symbols_per_frame * config.symbol_duration_samples();
 
     eprint!("Receiving");
     while frames_decoded < count {
-        let chunk = {
+        {
             let mut b = buf.lock().unwrap();
-            let len = b.len();
-            if len < config.preamble_samples() {
-                std::mem::drop(b);
-                std::thread::sleep(std::time::Duration::from_millis(50));
-                continue;
-            }
-            let chunk: Vec<f32> = b.drain(..len / 2).collect();
-            chunk
-        };
+            rx_batch.extend(b.drain(..));
+        }
 
-        if let Some(result) = demodulator.process_samples(&chunk) {
+        if rx_batch.len() < min_decode {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            continue;
+        }
+
+        if let Some(result) = demodulator.process_samples(&rx_batch) {
             let n = result.bytes.len().min(config.payload_size);
             received.extend_from_slice(&result.bytes[..n]);
             frames_decoded += 1;
             eprint!("\rReceived {} frames (peak={:.3}, cfo={:.4})", frames_decoded, result.preamble_peak, result.cfo_rad_per_sym);
+            let consumed = result.consumed_samples.min(rx_batch.len());
+            rx_batch.drain(..consumed);
+            demodulator.reset();
+        } else {
+            // Advance by a fraction of a frame to keep scanning
+            let advance = (rx_batch.len() / 4).max(1);
+            rx_batch.drain(..advance);
+            demodulator.reset();
         }
     }
     eprintln!();
@@ -248,25 +256,31 @@ fn test_mode(config: &Config, duration_secs: f64, device_name: Option<&str>) -> 
     eprintln!("{:<6} {:<10} {:<10} {:<12} {:<12} {:<10}", "Frame", "Peak", "CFO", "|H| mean", "Dropped", "Rate");
     eprintln!("{:-<70}", "");
 
+    let mut rx_batch: Vec<f32> = Vec::new();
+
     while start.elapsed().as_secs_f64() < duration_secs {
-        let chunk = {
+        {
             let mut b = buf.lock().unwrap();
-            let len = b.len();
-            if len < config.preamble_samples() {
-                std::mem::drop(b);
-                std::thread::sleep(std::time::Duration::from_millis(20));
-                continue;
-            }
-            let chunk: Vec<f32> = b.drain(..len / 2).collect();
-            chunk
-        };
+            rx_batch.extend(b.drain(..));
+        }
+
+        if rx_batch.len() < config.preamble_samples() + config.symbol_duration_samples() {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            continue;
+        }
 
         total_frames += 1;
-        if let Some(result) = demodulator.process_samples(&chunk) {
+        if let Some(result) = demodulator.process_samples(&rx_batch) {
             valid_frames += 1;
             last_peak = result.preamble_peak;
             last_cfo = result.cfo_rad_per_sym;
             last_h = result.mean_h_magnitude;
+            let consumed = result.consumed_samples.min(rx_batch.len());
+            rx_batch.drain(..consumed);
+            demodulator.reset();
+        } else {
+            let advance = (rx_batch.len() / 4).max(1);
+            rx_batch.drain(..advance);
             demodulator.reset();
         }
 

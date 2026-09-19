@@ -82,7 +82,7 @@ impl OfdmDemodulator {
         let mut i = 0;
         while i < search_limit {
             let energy: f32 = samples[i..i + win_size].iter().map(|&s| s * s).sum();
-            if energy > 1e-4_f32 * win_size as f32 {
+            if energy > 1e-6_f32 * win_size as f32 {
                 return Some(i);
             }
             i += step;

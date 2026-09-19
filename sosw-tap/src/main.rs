@@ -1,10 +1,10 @@
 use anyhow::Result;
 use clap::Parser;
-use cpal::traits::{DeviceTrait, HostTrait};
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use sosw_core::Config;
 use sosw_tap::mac::{Mac, MacConfig};
 use sosw_tap::phy::Phy;
-use sosw_tap::tap::TapInterface;
+use sosw_tap::tap::{Tappable, TapInterface};
 
 #[derive(Parser)]
 #[command(name = "sosw-tap", about = "Sonic WiFi — Ethernet over OFDM audio")]
@@ -36,7 +36,7 @@ enum Cli {
         rx_device: Option<String>,
 
         /// DIFS in milliseconds
-        #[arg(long, default_value = "300")]
+        #[arg(long, default_value = "600")]
         difs: u64,
 
         /// Slot time in milliseconds
@@ -56,7 +56,7 @@ enum Cli {
         max_retries: u8,
 
         /// ACK timeout in milliseconds
-        #[arg(long, default_value = "700")]
+        #[arg(long, default_value = "2000")]
         ack_timeout: u64,
     },
     /// List available audio devices
@@ -127,9 +127,18 @@ fn serve(
     max_retries: u8,
     ack_timeout: u64,
 ) -> Result<()> {
-    let id = node_id.unwrap_or(1);
+    // Derive a stable default node ID from the hostname so different
+    // machines on the same TAP name still get distinct IDs.
+    let id = node_id.unwrap_or_else(|| {
+        let hostname = std::fs::read_to_string("/proc/sys/kernel/hostname")
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let hash = hostname.bytes().fold(0u8, |acc, b| acc.wrapping_add(b));
+        if hash == 0 { 1 } else { hash }
+    });
 
-    let tap = TapInterface::create(Some(tap_name))?;
+    let tap: Box<dyn Tappable> = Box::new(TapInterface::create(Some(tap_name))?);
     log::info!("TAP interface: {}", tap.name_string());
     log::info!("Node ID: {}", id);
 

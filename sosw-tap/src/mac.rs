@@ -1,6 +1,6 @@
 use crate::fragment::{FragmentHeader, ReassemblyBuffer};
 use crate::phy::Phy;
-use crate::tap::TapInterface;
+use crate::tap::Tappable;
 use anyhow::Result;
 use rand::Rng as _;
 use std::time::{Duration, Instant};
@@ -23,12 +23,16 @@ impl Default for MacConfig {
     fn default() -> Self {
         Self {
             node_id: 1,
-            difs_ms: 300,
+            // A default frame is ~260 ms; DIFS must cover a full frame plus
+            // propagation/processing delay on the acoustic channel.
+            difs_ms: 600,
             slot_ms: 60,
             cw_min: 4,
             cw_max: 64,
             max_retries: 5,
-            ack_timeout_ms: 700,
+            // ACK timeout must cover: frame TX time + RX processing + ACK TX
+            // time + RX processing + margin. 2 s is conservative for default.
+            ack_timeout_ms: 2000,
         }
     }
 }
@@ -56,7 +60,7 @@ enum Phase {
 pub struct Mac {
     config: MacConfig,
     phy: Phy,
-    tap: TapInterface,
+    tap: Box<dyn Tappable>,
     reassembly: ReassemblyBuffer,
 
     // TX state
@@ -69,10 +73,14 @@ pub struct Mac {
     cw: u8,
     frame_id_counter: u8,
     tx_frame_id: u8,
+
+    // Loop buffers
+    tap_buf: Vec<u8>,
+    ack_queue: Vec<(u8, u8)>,
 }
 
 impl Mac {
-    pub fn new(config: MacConfig, phy: Phy, tap: TapInterface) -> Self {
+    pub fn new(config: MacConfig, phy: Phy, tap: Box<dyn Tappable>) -> Self {
         Self {
             config,
             phy,
@@ -87,142 +95,140 @@ impl Mac {
             cw: 4,
             frame_id_counter: 0,
             tx_frame_id: 0,
+            tap_buf: vec![0u8; 65536],
+            ack_queue: Vec::new(),
         }
     }
 
     pub fn run(&mut self) -> Result<()> {
-        let mut tap_buf = vec![0u8; 65536];
-        let mut ack_queue: Vec<(u8, u8)> = Vec::new();
-
         loop {
-            // 1. Drain Ethernet frames from TAP into TX pipeline
-            if self.phase == Phase::Idle {
-                while let Some(n) = self.tap.recv(&mut tap_buf)? {
-                    self.start_tx(tap_buf[..n].to_vec());
-                }
-            }
+            self.run_one_iteration()?;
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
 
-            // 2. Process received OFDM frames
-            while let Some(frame) = self.phy.receive_frame() {
-                if frame.frame_type == FRAME_TYPE_DATA {
-                    if let Some(hdr) = FragmentHeader::decode(&frame.payload) {
-                        let is_for_us =
-                            hdr.dst_id == self.config.node_id || hdr.dst_id == 0xFF;
-                        if is_for_us {
-                            let src_id = hdr.src_id;
-                            let fid = hdr.frame_id;
-                            let fidx = hdr.frag_index;
-                            self.send_ack(src_id, fid, fidx);
-                        }
-                        if let Some(eth_frame) =
-                            self.reassembly.add_fragment(&frame.payload)
-                        {
-                            log::info!(
-                                "reassembled Ethernet frame ({} B)",
-                                eth_frame.len()
-                            );
-                            if let Err(e) = self.tap.send(&eth_frame) {
-                                log::error!("tap send: {}", e);
-                            }
-                        }
+    pub fn run_one_iteration(&mut self) -> Result<()> {
+        // 1. Drain Ethernet frames from TAP into TX pipeline
+        if self.phase == Phase::Idle {
+            while let Some(n) = self.tap.recv(&mut self.tap_buf)? {
+                let frame = self.tap_buf[..n].to_vec();
+                self.start_tx(frame);
+            }
+        }
+
+        // 2. Process received OFDM frames
+        while let Some(frame) = self.phy.receive_frame() {
+            if frame.frame_type == FRAME_TYPE_DATA {
+                if let Some(hdr) = FragmentHeader::decode(&frame.payload) {
+                    let is_for_us =
+                        hdr.dst_id == self.config.node_id || hdr.dst_id == 0xFF;
+                    if is_for_us {
+                        let src_id = hdr.src_id;
+                        let fid = hdr.frame_id;
+                        let fidx = hdr.frag_index;
+                        self.send_ack(src_id, fid, fidx);
                     }
-                } else if frame.frame_type == FRAME_TYPE_ACK {
-                    if frame.payload.len() >= 4 {
-                        let ack_dst = frame.payload[0];
-                        let ack_fid = frame.payload[2];
-                        let ack_fidx = frame.payload[3];
-                        if ack_dst == self.config.node_id {
-                            ack_queue.push((ack_fid, ack_fidx));
+                    if let Some(eth_frame) = self.reassembly.add_fragment(&frame.payload) {
+                        log::info!("reassembled Ethernet frame ({} B)", eth_frame.len());
+                        if let Err(e) = self.tap.send(&eth_frame) {
+                            log::error!("tap send: {}", e);
                         }
                     }
                 }
+            } else if frame.frame_type == FRAME_TYPE_ACK {
+                if frame.payload.len() >= 4 {
+                    let ack_dst = frame.payload[0];
+                    let ack_fid = frame.payload[2];
+                    let ack_fidx = frame.payload[3];
+                    if ack_dst == self.config.node_id {
+                        self.ack_queue.push((ack_fid, ack_fidx));
+                    }
+                }
             }
+        }
 
-            // 3. Process ACKs
-            for (fid, _fidx) in ack_queue.drain(..) {
-                if self.phase == Phase::WaitingAck && fid == self.tx_frame_id {
-                    self.frag_idx += 1;
-                    self.retries = 0;
-                    self.cw = self.config.cw_min;
-                    if self.frag_idx >= self.fragments.len() {
-                        log::info!("frame TX complete ({} fragments)", self.frag_idx);
+        // 3. Process ACKs
+        for (fid, _fidx) in self.ack_queue.drain(..) {
+            if self.phase == Phase::WaitingAck && fid == self.tx_frame_id {
+                self.frag_idx += 1;
+                self.retries = 0;
+                self.cw = self.config.cw_min;
+                if self.frag_idx >= self.fragments.len() {
+                    log::info!("frame TX complete ({} fragments)", self.frag_idx);
+                    self.phase = Phase::Idle;
+                    self.eth_frame.clear();
+                    self.fragments.clear();
+                } else {
+                    self.phase = Phase::Idle;
+                }
+            }
+        }
+
+        // 4. Run TX state machine
+        match self.phase {
+            Phase::Idle => {}
+            Phase::Sensing => {
+                if self.phase_start.elapsed() >= self.config.difs() {
+                    if !self.phy.carrier_sense() {
+                        let backoff_ms =
+                            rand::rng().random_range(0..=self.cw as u64)
+                                * self.config.slot_ms;
+                        self.phase = Phase::Backoff;
+                        self.phase_start =
+                            Instant::now() + Duration::from_millis(backoff_ms);
+                    } else {
+                        self.phase_start = Instant::now();
+                    }
+                }
+            }
+            Phase::Backoff => {
+                if Instant::now() >= self.phase_start {
+                    let frag = &self.fragments[self.frag_idx];
+                    let audio = self.phy.transmit_frame(frag, FRAME_TYPE_DATA);
+                    let sample_count = audio.len();
+                    self.phy.begin_tx_mute();
+                    self.phy.play_samples(&audio);
+                    self.phy.wait_tx_done(sample_count);
+                    self.phy.end_tx_mute();
+
+                    self.tx_frame_id = FragmentHeader::decode(frag)
+                        .map(|h| h.frame_id)
+                        .unwrap_or(0);
+
+                    self.phase = Phase::WaitingAck;
+                    self.phase_start = Instant::now();
+                }
+            }
+            Phase::WaitingAck => {
+                if self.phase_start.elapsed() >= self.config.ack_timeout() {
+                    self.retries += 1;
+                    if self.retries > self.config.max_retries {
+                        log::warn!("max retries reached for frame, dropping");
                         self.phase = Phase::Idle;
                         self.eth_frame.clear();
                         self.fragments.clear();
                     } else {
+                        self.cw = (self.cw * 2).min(self.config.cw_max);
+                        log::info!(
+                            "retry {}/{} for frag {}",
+                            self.retries,
+                            self.config.max_retries,
+                            self.frag_idx
+                        );
                         self.phase = Phase::Idle;
                     }
                 }
             }
-
-            // 4. Run TX state machine
-            match self.phase {
-                Phase::Idle => {}
-                Phase::Sensing => {
-                    if self.phase_start.elapsed() >= self.config.difs() {
-                        if !self.phy.carrier_sense() {
-                            let backoff_ms =
-                                rand::rng().random_range(0..=self.cw as u64)
-                                    * self.config.slot_ms;
-                            self.phase = Phase::Backoff;
-                            self.phase_start =
-                                Instant::now() + Duration::from_millis(backoff_ms);
-                        } else {
-                            self.phase_start = Instant::now();
-                        }
-                    }
-                }
-                Phase::Backoff => {
-                    if Instant::now() >= self.phase_start {
-                        let frag = &self.fragments[self.frag_idx];
-                        let audio = self.phy.transmit_frame(frag, FRAME_TYPE_DATA);
-                        let sample_count = audio.len();
-                        self.phy.begin_tx_mute();
-                        self.phy.play_samples(&audio);
-                        self.phy.wait_tx_done(sample_count);
-                        self.phy.end_tx_mute();
-
-                        self.tx_frame_id = FragmentHeader::decode(frag)
-                            .map(|h| h.frame_id)
-                            .unwrap_or(0);
-
-                        self.phase = Phase::WaitingAck;
-                        self.phase_start = Instant::now();
-                    }
-                }
-                Phase::WaitingAck => {
-                    if self.phase_start.elapsed() >= self.config.ack_timeout() {
-                        self.retries += 1;
-                        if self.retries > self.config.max_retries {
-                            log::warn!(
-                                "max retries reached for frame, dropping"
-                            );
-                            self.phase = Phase::Idle;
-                            self.eth_frame.clear();
-                            self.fragments.clear();
-                        } else {
-                            self.cw = (self.cw * 2).min(self.config.cw_max);
-                            log::info!(
-                                "retry {}/{} for frag {}",
-                                self.retries,
-                                self.config.max_retries,
-                                self.frag_idx
-                            );
-                            self.phase = Phase::Idle;
-                        }
-                    }
-                }
-            }
-
-            // 5. Progress
-            if self.phase == Phase::Idle && !self.fragments.is_empty() {
-                self.phase = Phase::Sensing;
-                self.phase_start = Instant::now();
-            }
-
-            self.reassembly.cleanup();
-            std::thread::sleep(Duration::from_millis(20));
         }
+
+        // 5. Progress
+        if self.phase == Phase::Idle && !self.fragments.is_empty() {
+            self.phase = Phase::Sensing;
+            self.phase_start = Instant::now();
+        }
+
+        self.reassembly.cleanup();
+        Ok(())
     }
 
     fn start_tx(&mut self, eth_frame: Vec<u8>) {

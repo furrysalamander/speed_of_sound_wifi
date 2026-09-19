@@ -1,6 +1,6 @@
 use anyhow::Result;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use sosw_core::physical::preamble::{compute_cross_correlation, generate_preamble_audio};
+use sosw_core::physical::preamble::{compute_cross_correlation, find_preamble_peak, generate_preamble_audio};
 use sosw_core::link::frame::{FrameAssembler, FrameParser, ParsedFrame};
 use sosw_core::physical::ofdm_demod::OfdmDemodulator;
 use sosw_core::physical::ofdm_mod::OfdmModulator;
@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-const DEFAULT_TX_GAIN: f32 = 1.0;
+const DEFAULT_TX_GAIN: f32 = 12.0;
 
 const CARRIER_SENSE_THRESHOLD: f32 = 0.03;
 
@@ -171,10 +171,10 @@ impl Phy {
         }
 
         let corr = compute_cross_correlation(&buf, &self.preamble_audio);
-        let peak = corr.iter().cloned().fold(0.0f32, f32::max);
-        let signal_energy: f32 = buf.iter().map(|&s| s * s).sum::<f32>().max(1e-12);
-        let norm = peak / (self.preamble_energy * signal_energy).sqrt().max(1e-12);
-        norm > CARRIER_SENSE_THRESHOLD
+        if let Some((_, norm)) = find_preamble_peak(&corr, self.preamble_energy, &buf, self.preamble_audio.len()) {
+            return norm > CARRIER_SENSE_THRESHOLD;
+        }
+        false
     }
 
     pub fn receive_frame(&mut self) -> Option<ParsedFrame> {
@@ -220,11 +220,7 @@ impl Phy {
         }
         let mut frames = self.frame_parser.feed_bytes(&result.bytes);
         if frames.is_empty() {
-            // Preamble detected but frame invalid — likely a noise false positive.
-            // Instead of draining `consumed` (which may contain the real echo),
-            // set rx_skip to advance past just the preamble length next call,
-            // so we slowly nudge past noise bursts without skipping the real signal.
-            self.rx_skip = self.config.preamble_samples() / 4;
+            self.rx_batch.drain(..consumed);
             self.demodulator.reset();
             return None;
         }

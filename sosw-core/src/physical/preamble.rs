@@ -69,12 +69,42 @@ pub fn find_preamble_peak(
     if corr.is_empty() || preamble_energy <= 0.0 {
         return None;
     }
+
+    // Find global maximum correlation.
     let peak_idx = corr
         .iter()
         .enumerate()
         .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
         .map(|(i, _)| i)?;
     let peak_val = corr[peak_idx];
+    if !peak_val.is_finite() || peak_val <= 0.0 {
+        return None;
+    }
+
+    // Require the peak to be a local maximum in its immediate neighborhood.
+    let local_win = (preamble_len / 8).max(2);
+    let local_start = peak_idx.saturating_sub(local_win);
+    let local_end = std::cmp::min(peak_idx + local_win + 1, corr.len());
+    for i in local_start..local_end {
+        if i != peak_idx && corr[i] > peak_val {
+            return None;
+        }
+    }
+
+    // Require the peak to dominate the rest of the search region.
+    // The exclusion zone is half the preamble length (covers the main lobe).
+    let excl = (preamble_len / 2).max(1);
+    let second_peak = corr
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i < peak_idx.saturating_sub(excl) || *i > peak_idx + excl)
+        .map(|(_, v)| *v)
+        .fold(0.0f32, f32::max);
+    // Peak must be at least 1.5x the next largest value (ignore tiny noise floor).
+    if second_peak > 1e-6 && peak_val < 1.5 * second_peak {
+        return None;
+    }
+
     let window_start = peak_idx;
     let window_end = std::cmp::min(window_start + preamble_len, signal.len());
     let signal_window: f32 = signal[window_start..window_end]

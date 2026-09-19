@@ -5,10 +5,13 @@ use crate::physical::qpsk;
 use ndarray::Array1;
 use num_complex::Complex32;
 use rustfft::FftPlanner;
+use std::sync::Arc;
 
 pub struct OfdmModulator {
     config: Config,
     inner: OfdmModulatorInner,
+    fft: Arc<dyn rustfft::Fft<f32>>,
+    ifft: Arc<dyn rustfft::Fft<f32>>,
     scrambler: Scrambler,
     preamble_audio: Vec<f32>,
 }
@@ -30,7 +33,7 @@ impl OfdmModulatorInner {
         let cp_length = self.config.cp_length;
 
         let mut fd = Array1::<Complex32>::zeros(fft_size);
-        let _n_sc = fd_data.len();
+        let n_sc = fd_data.len();
         for (i, &val) in fd_data.iter().enumerate() {
             fd[sc_min + i] = val;
         }
@@ -63,12 +66,17 @@ impl OfdmModulatorInner {
 
 impl OfdmModulator {
     pub fn new(config: &Config) -> Self {
-        let _fft_size = config.fft_size;
+        let fft_size = config.fft_size;
+        let mut planner = FftPlanner::new();
+        let fft = planner.plan_fft_forward(fft_size);
+        let ifft = planner.plan_fft_inverse(fft_size);
         let preamble_audio = generate_preamble_audio(config);
         let scrambler = Scrambler::new(config.scrambler_seed);
         Self {
             config: config.clone(),
             inner: OfdmModulatorInner::new(config),
+            fft,
+            ifft,
             scrambler,
             preamble_audio,
         }
