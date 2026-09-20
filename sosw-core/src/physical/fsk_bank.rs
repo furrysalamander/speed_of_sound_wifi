@@ -24,6 +24,10 @@ pub struct BankDecoded {
     pub min_snr_db: f32,
     pub mean_confidence: f32,
     pub fec_ok: bool,
+    /// Per-channel mean tone SNR over the preamble (sounding).
+    pub per_channel_snr: Vec<f32>,
+    /// Per-channel preamble symbol match fraction (sounding).
+    pub per_channel_match: Vec<f32>,
     pub consumed_samples: usize,
 }
 
@@ -39,6 +43,10 @@ pub struct FskBankConfig {
     pub tone_stride: usize,
     /// Grid units between the starts of adjacent channels (guard if larger).
     pub channel_stride: usize,
+    /// Optional explicit absolute base frequency per channel. When non-empty
+    /// this overrides base_freq/channel_stride, letting link training place
+    /// channels only on carriers that survived the room's notches.
+    pub carrier_freqs: Vec<f32>,
     pub amplitude: f32,
     pub preamble_symbols: usize,
     pub preamble_seed: u32,
@@ -60,6 +68,7 @@ impl Default for FskBankConfig {
             base_freq: 1_200.0,
             tone_stride: 1,
             channel_stride: 3, // one guard tone between channels
+            carrier_freqs: Vec::new(),
             amplitude: 0.5,
             preamble_symbols: 24,
             preamble_seed: 0xBA11,
@@ -82,13 +91,26 @@ impl FskBankConfig {
     }
 
     pub fn tone_freq(&self, channel: usize, tone: usize) -> f32 {
-        let idx = channel * self.channel_stride + tone * self.tone_stride;
-        self.base_freq + idx as f32 * self.grid_spacing()
+        if !self.carrier_freqs.is_empty() {
+            self.carrier_freqs[channel] + tone as f32 * self.grid_spacing()
+        } else {
+            let idx = channel * self.channel_stride + tone * self.tone_stride;
+            self.base_freq + idx as f32 * self.grid_spacing()
+        }
+    }
+
+    /// Number of channels actually used (explicit carriers override n_channels).
+    pub fn channels(&self) -> usize {
+        if self.carrier_freqs.is_empty() {
+            self.n_channels
+        } else {
+            self.carrier_freqs.len()
+        }
     }
 
     pub fn highest_freq(&self) -> f32 {
         self.tone_freq(
-            self.n_channels.saturating_sub(1),
+            self.channels().saturating_sub(1),
             self.tones_per_channel.saturating_sub(1),
         )
     }
@@ -98,7 +120,7 @@ impl FskBankConfig {
     }
 
     pub fn raw_bps(&self) -> f32 {
-        (self.n_channels * self.bits_per_channel_symbol()) as f32
+        (self.channels() * self.bits_per_channel_symbol()) as f32
             * self.sample_rate as f32
             / self.symbol_samples as f32
     }
@@ -135,11 +157,11 @@ impl FskBankConfig {
     pub fn bytes_to_matrix(&self, bytes: &[u8]) -> Vec<Vec<u8>> {
         let bps = self.bits_per_channel_symbol();
         let bits = bytes_to_bits(bytes);
-        let per_period = self.n_channels * bps;
+        let per_period = self.channels() * bps;
         let mut rows = Vec::new();
         let mut i = 0;
         while i < bits.len() {
-            let mut row = vec![0u8; self.n_channels];
+            let mut row = vec![0u8; self.channels()];
             for (c, slot) in row.iter_mut().enumerate() {
                 let mut v = 0u8;
                 for b in 0..bps {
@@ -230,14 +252,14 @@ impl FskBankConfig {
         let pre = self.preamble();
         let payload = self.bytes_to_matrix(bytes);
         let n = self.symbol_samples;
-        let gain = self.amplitude / (self.n_channels as f32).sqrt();
-        let mut phases = vec![0.0f32; self.n_channels];
+        let gain = self.amplitude / (self.channels() as f32).sqrt();
+        let mut phases = vec![0.0f32; self.channels()];
         let mut out = Vec::with_capacity((pre.len() + payload.len()) * n);
 
         let mut period = |row: &[u8], out: &mut Vec<f32>| {
             for i in 0..n {
                 let mut acc = 0.0f32;
-                for c in 0..self.n_channels {
+                for c in 0..self.channels() {
                     let f = self.tone_freq(c, (row[c] as usize) % self.tones_per_channel);
                     acc += phases[c].sin();
                     phases[c] += 2.0 * PI * f / self.sample_rate as f32;
@@ -251,7 +273,7 @@ impl FskBankConfig {
         };
 
         for &p in &pre {
-            let row = vec![p; self.n_channels];
+            let row = vec![p; self.channels()];
             period(&row, &mut out);
         }
         for row in &payload {
@@ -407,7 +429,7 @@ impl FskBankDemodulator {
 
         // Grid search across all channels simultaneously. Score a candidate
         // offset by how many channel/preamble slots match.
-        let total_slots = pre.len() * self.cfg.n_channels;
+        let total_slots = pre.len() * self.cfg.channels();
         let score = |off: usize| -> (usize, usize) {
             let mut matches = 0usize;
             let mut seen = 0usize;
@@ -416,7 +438,7 @@ impl FskBankDemodulator {
                 if a + n > region.len() {
                     break;
                 }
-                for c in 0..self.cfg.n_channels {
+                for c in 0..self.cfg.channels() {
                     let e = self.tone_energies(&region[a..a + n], c);
                     let ones = vec![1.0f32; e.len()];
                     let (sym, _, _) = Self::decide(&e, &ones);
@@ -458,13 +480,13 @@ impl FskBankDemodulator {
             }
         }
         let off = best_fine.0;
-        if best_fine.1 * 4 < total_slots * 3 {
+        if best_fine.1 * 5 < total_slots * 2 {
             return None;
         }
 
         // Learn per-tone gains per channel from the preamble.
-        let mut gains = vec![vec![1.0f32; self.cfg.tones_per_channel]; self.cfg.n_channels];
-        for c in 0..self.cfg.n_channels {
+        let mut gains = vec![vec![1.0f32; self.cfg.tones_per_channel]; self.cfg.channels()];
+        for c in 0..self.cfg.channels() {
             let mut acc = vec![0.0f32; self.cfg.tones_per_channel];
             let mut cnt = vec![0usize; self.cfg.tones_per_channel];
             for (i, &ps) in pre.iter().enumerate() {
@@ -501,6 +523,32 @@ impl FskBankDemodulator {
             }
         }
 
+        // Per-channel preamble statistics (used for carrier sounding).
+        let mut per_ch_snr = vec![0.0f32; self.cfg.channels()];
+        let mut per_ch_match = vec![0.0f32; self.cfg.channels()];
+        for c in 0..self.cfg.channels() {
+            let mut snr_sum = 0.0f32;
+            let mut matches = 0usize;
+            let mut cnt = 0usize;
+            for (i, &ps) in pre.iter().enumerate() {
+                let a = off + i * n;
+                if a + n > region.len() {
+                    break;
+                }
+                let e = self.tone_energies(&region[a..a + n], c);
+                let (sym, _, snr) = Self::decide(&e, &gains[c]);
+                snr_sum += snr;
+                cnt += 1;
+                if sym == ps {
+                    matches += 1;
+                }
+            }
+            if cnt > 0 {
+                per_ch_snr[c] = snr_sum / cnt as f32;
+                per_ch_match[c] = matches as f32 / cnt as f32;
+            }
+        }
+
         // Decode payload periods.
         let n_periods = (region.len().saturating_sub(off + pre.len() * n)) / n;
         if n_periods == 0 {
@@ -511,8 +559,8 @@ impl FskBankDemodulator {
         let mut confs = Vec::new();
         for p in 0..n_periods {
             let a = off + (pre.len() + p) * n;
-            let mut row = vec![0u8; self.cfg.n_channels];
-            for c in 0..self.cfg.n_channels {
+            let mut row = vec![0u8; self.cfg.channels()];
+            for c in 0..self.cfg.channels() {
                 let e = self.tone_energies(&region[a..a + n], c);
                 let (sym, conf, snr) = Self::decide(&e, &gains[c]);
                 row[c] = sym;
@@ -532,11 +580,13 @@ impl FskBankDemodulator {
         Some(BankDecoded {
             bytes,
             n_periods,
-            n_channels: self.cfg.n_channels,
+            n_channels: self.cfg.channels(),
             mean_snr_db: mean_snr,
             min_snr_db: if min_snr.is_finite() { min_snr } else { 0.0 },
             mean_confidence: mean_conf,
             fec_ok,
+            per_channel_snr: per_ch_snr,
+            per_channel_match: per_ch_match,
             consumed_samples: region.len(),
         })
     }

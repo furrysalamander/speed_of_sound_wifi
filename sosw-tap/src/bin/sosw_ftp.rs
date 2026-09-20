@@ -12,7 +12,8 @@
 use anyhow::Result;
 use clap::Parser;
 use sosw_core::physical::fsk::FskConfig;
-use sosw_tap::xfer::{self, run_receiver, run_sender, AudioTransport, SimTransport};
+use sosw_core::physical::fsk_bank::FskBankConfig;
+use sosw_tap::xfer::{self, run_receiver, run_sender, AudioTransport, BankTransport, SimTransport};
 use std::time::Instant;
 
 
@@ -68,6 +69,16 @@ struct Args {
     /// Dump all received audio to this raw f32 file (for offline diagnosis).
     #[arg(long)]
     dump_rx: Option<String>,
+    /// Use the parallel FSK bank on these carrier base frequencies (Hz),
+    /// comma-separated. Empty = single-stream FSK.
+    #[arg(long, value_delimiter = ',')]
+    carriers: Vec<f32>,
+    /// Bank channels are 2-FSK (default).
+    #[arg(long, default_value_t = 2)]
+    tones: usize,
+    /// Payload bytes per ARQ chunk.
+    #[arg(long, default_value_t = xfer::CHUNK)]
+    chunk: usize,
 }
 
 fn make_cfg(a: &Args) -> FskConfig {
@@ -98,10 +109,27 @@ fn make_ack_cfg(a: &Args) -> FskConfig {
     }
 }
 
+fn make_bank_cfg(a: &Args) -> FskBankConfig {
+    FskBankConfig {
+        n_channels: a.carriers.len(),
+        tones_per_channel: a.tones,
+        symbol_samples: (a.symbol_ms as usize * SR as usize) / 1000,
+        carrier_freqs: a.carriers.clone(),
+        amplitude: a.amplitude,
+        preamble_symbols: a.preamble,
+        guard_samples: (a.guard_ms as usize * SR as usize) / 1000,
+        rs_nsym: a.rs_nsym,
+        fec_data_block: a.fec_block,
+        payload_size: xfer::CHUNK + 8,
+        ..FskBankConfig::default()
+    }
+}
+
 fn main() -> Result<()> {
     let a = Args::parse();
     let cfg = make_cfg(&a);
     let ack_cfg = make_ack_cfg(&a);
+    let use_bank = !a.carriers.is_empty();
     match a.mode.as_str() {
         "sim" => {
             let data: Vec<u8> = (0..a.bytes).map(|i| (i as u8).wrapping_mul(37).wrapping_add(5)).collect();
@@ -109,11 +137,11 @@ fn main() -> Result<()> {
             println!(
                 "sim: {} bytes, {} chunks, snr={:?} dB, drop={:.2}",
                 data.len(),
-                xfer::chunk_count(data.len()),
+                xfer::chunk_count(data.len(), a.chunk),
                 a.snr_db,
                 a.drop
             );
-            let stats = run_sender(&data, &mut ch, 10, a.max_retries.max(1), &cfg, &cfg);
+            let stats = run_sender(&data, &mut ch, 10, a.max_retries.max(1), &cfg, &cfg, a.chunk);
             let ok = ch.received == data;
             println!(
                 "result: received {} bytes, {} chunks, {} retransmits, {} timeouts, {} channel drops, matches={}",
@@ -131,15 +159,24 @@ fn main() -> Result<()> {
         "send" => {
             let path = a.file.as_deref().ok_or_else(|| anyhow::anyhow!("--file required"))?;
             let data = std::fs::read(path)?;
+            let start = Instant::now();
+            if use_bank {
+                let bcfg = make_bank_cfg(&a);
+                let mut t = BankTransport::new(a.tx_device.as_deref(), a.rx_device.as_deref(), bcfg, a.dump_rx.as_deref())?;
+                println!("sending {} bytes ({} chunks, bank {} carriers) ...", data.len(), xfer::chunk_count(data.len(), a.chunk), a.carriers.len());
+                let stats = run_sender(&data, &mut t, a.ack_timeout_ms, a.max_retries, &cfg, &ack_cfg, a.chunk);
+                let dur = start.elapsed().as_secs_f32();
+                println!("done: {} chunks, {} retransmits, {} timeouts in {:.1}s ({:.1} B/s)", stats.chunks, stats.retransmits, stats.timeouts, dur, data.len() as f32 / dur.max(0.01));
+                return Ok(());
+            }
             let mut t = AudioTransport::with_dump(a.tx_device.as_deref(), a.rx_device.as_deref(), cfg.clone(), a.dump_rx.as_deref())?;
             println!(
                 "sending {} bytes ({} chunks, {} bps raw) ...",
                 data.len(),
-                xfer::chunk_count(data.len()),
+                xfer::chunk_count(data.len(), a.chunk),
                 cfg.raw_bps()
             );
-            let start = Instant::now();
-            let stats = run_sender(&data, &mut t, a.ack_timeout_ms, a.max_retries, &cfg, &ack_cfg);
+            let stats = run_sender(&data, &mut t, a.ack_timeout_ms, a.max_retries, &cfg, &ack_cfg, a.chunk);
             let dur = start.elapsed().as_secs_f32();
             println!(
                 "done: {} chunks, {} retransmits, {} timeouts in {:.1}s ({:.1} B/s)",
@@ -152,6 +189,15 @@ fn main() -> Result<()> {
         }
         "recv" => {
             let path = a.out.as_deref().unwrap_or("received.bin");
+            if use_bank {
+                let bcfg = make_bank_cfg(&a);
+                let mut t = BankTransport::new(a.tx_device.as_deref(), a.rx_device.as_deref(), bcfg, a.dump_rx.as_deref())?;
+                println!("listening for bank transfer (timeout {} ms, {} carriers) ...", a.timeout_ms, a.carriers.len());
+                let (data, stats) = run_receiver(&mut t, a.timeout_ms, a.max_rounds, &cfg, &ack_cfg);
+                std::fs::write(path, &data)?;
+                println!("received {} bytes ({} chunks) -> {}", data.len(), stats.chunks, path);
+                return Ok(());
+            }
             let mut t = AudioTransport::with_dump(a.tx_device.as_deref(), a.rx_device.as_deref(), cfg.clone(), a.dump_rx.as_deref())?;
             println!("listening for transfer (timeout {} ms) ...", a.timeout_ms);
             let (data, stats) = run_receiver(&mut t, a.timeout_ms, a.max_rounds, &cfg, &ack_cfg);

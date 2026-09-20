@@ -56,6 +56,9 @@ struct Args {
     /// Grid units between bank channels (guard = stride - tones).
     #[arg(long, default_value_t = 3)]
     channel_stride: usize,
+    /// Explicit comma-separated carrier base frequencies (Hz) for the bank.
+    #[arg(long, value_delimiter = ',')]
+    carriers: Vec<f32>,
     /// AWGN SNR in dB for software mode (omit for clean).
     #[arg(long)]
     snr_db: Option<f32>,
@@ -118,6 +121,7 @@ fn make_bank_cfg(a: &Args) -> FskBankConfig {
         rs_nsym: a.rs_nsym,
         fec_data_block: a.fec_block,
         payload_size: a.payload,
+        carrier_freqs: a.carriers.clone(),
         ..FskBankConfig::default()
     }
 }
@@ -130,7 +134,7 @@ fn build_bank_script(cfg: &FskBankConfig, payloads: &[Vec<u8>]) -> Vec<f32> {
     out
 }
 
-fn evaluate_bank(cfg: &FskBankConfig, audio: &[f32], payloads: &[Vec<u8>]) -> Metrics {
+fn evaluate_bank(cfg: &FskBankConfig, audio: &[f32], payloads: &[Vec<u8>], diag: bool) -> Metrics {
     let dem = FskBankDemodulator::new(cfg.clone());
     let decoded = dem.decode_capture(audio);
     let mut m = Metrics {
@@ -140,7 +144,7 @@ fn evaluate_bank(cfg: &FskBankConfig, audio: &[f32], payloads: &[Vec<u8>]) -> Me
         ..Default::default()
     };
     let mut snr_sum = 0.0;
-    for (fi, d) in decoded.iter().enumerate() {
+    for d in decoded.iter() {
         m.decoded += 1;
         m.min_snr_db = m.min_snr_db.min(d.min_snr_db);
         m.min_conf = m.min_conf.min(d.mean_confidence);
@@ -150,7 +154,17 @@ fn evaluate_bank(cfg: &FskBankConfig, audio: &[f32], payloads: &[Vec<u8>]) -> Me
                 m.valid += 1;
             }
         }
-        let _ = fi;
+        if diag {
+            for c in 0..d.n_channels {
+                eprintln!(
+                    "  [sound] ch {:2} base={:6.0}Hz snr={:5.1}dB match={:.2}",
+                    c,
+                    cfg.tone_freq(c, 0),
+                    d.per_channel_snr.get(c).copied().unwrap_or(0.0),
+                    d.per_channel_match.get(c).copied().unwrap_or(0.0)
+                );
+            }
+        }
     }
     m.mean_snr_db = if m.decoded > 0 {
         snr_sum / m.decoded as f32
@@ -214,7 +228,7 @@ fn run_bank(a: &Args, ps: &[Vec<u8>]) -> Result<()> {
             if let Some(snr) = a.snr_db {
                 add_noise(&mut script, snr);
             }
-            let m = evaluate_bank(&cfg, &script, ps);
+            let m = evaluate_bank(&cfg, &script, ps, a.diag);
             report_bank(a, &cfg, &m);
         }
         "tx" => {
@@ -251,7 +265,7 @@ fn run_bank(a: &Args, ps: &[Vec<u8>]) -> Result<()> {
                 }
                 rec
             };
-            let m = evaluate_bank(&cfg, &rec, ps);
+            let m = evaluate_bank(&cfg, &rec, ps, a.diag);
             report_bank(a, &cfg, &m);
         }
         other => anyhow::bail!("unknown mode '{}'", other),
@@ -503,6 +517,7 @@ fn sweep(_a: &Args) -> Result<()> {
                 guard_ms: 125,
                 channels: 0,
                 channel_stride: 3,
+                carriers: Vec::new(),
                 rs_nsym: 0,
                 fec_block: 32,
                 snr_db: Some(snr),

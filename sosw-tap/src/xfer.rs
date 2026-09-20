@@ -4,6 +4,7 @@
 //! channel (unit-tested) and over real audio (the `sosw_ftp` binary).
 
 use sosw_core::physical::fsk::{self, FskConfig, FskDemodulator};
+use sosw_core::physical::fsk_bank::{FskBankConfig, FskBankDemodulator};
 
 pub const CHUNK: usize = 128;
 const KIND_DATA: u8 = 0;
@@ -68,8 +69,8 @@ pub fn decode_transport(bytes: &[u8]) -> Option<(u8, u16, u16, Vec<u8>)> {
     Some((kind, seq, total, bytes[6..6 + len].to_vec()))
 }
 
-pub fn chunk_count(data_len: usize) -> u16 {
-    data_len.div_ceil(CHUNK).max(1) as u16
+pub fn chunk_count(data_len: usize, chunk: usize) -> u16 {
+    data_len.div_ceil(chunk.max(1)).max(1) as u16
 }
 
 /// Stop-and-wait sender. Returns after every chunk is acknowledged and a BYE
@@ -81,12 +82,14 @@ pub fn run_sender<T: Transport>(
     max_retries: usize,
     data_cfg: &FskConfig,
     ack_cfg: &FskConfig,
+    chunk: usize,
 ) -> XferStats {
-    let total = chunk_count(data.len());
+    let chunk = chunk.max(1);
+    let total = chunk_count(data.len(), chunk);
     let mut stats = XferStats { bytes: data.len(), ..Default::default() };
     for seq in 0..total {
-        let start = seq as usize * CHUNK;
-        let end = (start + CHUNK).min(data.len());
+        let start = seq as usize * chunk;
+        let end = (start + chunk).min(data.len());
         let frame = encode_transport(KIND_DATA, seq, total, &data[start..end]);
         let mut acked = false;
         let mut chunk_air_ms = 0.0f64;
@@ -494,6 +497,115 @@ impl Transport for AudioTransport {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Parallel-FSK-bank endpoint (carrier-selective, higher rate).
+// ---------------------------------------------------------------------------
+
+pub struct BankTransport {
+    audio: crate::audio::DuplexAudio,
+    cfg: FskBankConfig,
+    last_quality: (f32, bool),
+    pending: std::collections::VecDeque<Vec<u8>>,
+    collected: Vec<f32>,
+    dump: Option<std::fs::File>,
+}
+
+impl BankTransport {
+    pub fn new(
+        tx: Option<&str>,
+        rx: Option<&str>,
+        cfg: FskBankConfig,
+        dump_path: Option<&str>,
+    ) -> anyhow::Result<Self> {
+        let dump = match dump_path {
+            Some(p) => Some(std::fs::File::create(p)?),
+            None => None,
+        };
+        Ok(Self {
+            audio: crate::audio::DuplexAudio::new(tx, rx)?,
+            cfg,
+            last_quality: (0.0, true),
+            pending: std::collections::VecDeque::new(),
+            collected: Vec::new(),
+            dump,
+        })
+    }
+}
+
+impl Transport for BankTransport {
+    fn send(&mut self, payload: &[u8]) {
+        self.audio.clear_rx();
+        self.pending.clear();
+        self.collected.clear();
+        let audio = self.cfg.encode_payload(payload);
+        eprintln!(
+            "[{}] TX(bank) {} samples ({:.1} s)",
+            now_ms(),
+            audio.len(),
+            audio.len() as f32 / 48_000.0
+        );
+        self.audio.play_muted(&audio, std::time::Duration::from_millis(ECHO_TAIL_MS));
+    }
+
+    fn recv(&mut self, timeout_ms: u64) -> Option<Vec<u8>> {
+        if let Some(p) = self.pending.pop_front() {
+            return Some(p);
+        }
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_millis(timeout_ms);
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let chunk = self.audio.take_rx();
+            if let Some(f) = &mut self.dump {
+                use std::io::Write;
+                let mut bytes = Vec::with_capacity(chunk.len() * 4);
+                for s in &chunk {
+                    bytes.extend_from_slice(&s.to_le_bytes());
+                }
+                let _ = f.write_all(&bytes);
+            }
+            self.collected.extend(chunk);
+            if self.collected.len() >= self.cfg.preamble_samples() {
+                let dem = FskBankDemodulator::new(self.cfg.clone());
+                for fr in dem.decode_capture(&self.collected) {
+                    if let Some(p) = fsk::unwrap_frame(&fr.bytes) {
+                        eprintln!(
+                            "[{}] RX(bank) frame (kind={}) minSNR={:.1}dB meanSNR={:.1}dB",
+                            now_ms(),
+                            p.first().copied().unwrap_or(255),
+                            fr.min_snr_db,
+                            fr.mean_snr_db
+                        );
+                        self.last_quality = (fr.min_snr_db, fr.fec_ok);
+                        self.pending.push_back(p);
+                    }
+                }
+                if !self.pending.is_empty() {
+                    self.collected.clear();
+                    return self.pending.pop_front();
+                }
+            }
+            if start.elapsed() > timeout {
+                return None;
+            }
+        }
+    }
+
+    /// Bank transport ignores the per-call FSK config: it always uses its bank
+    /// configuration, which carries the selected carriers.
+    fn send_cfg(&mut self, payload: &[u8], _cfg: &FskConfig) {
+        self.send(payload);
+    }
+
+    fn recv_cfg(&mut self, timeout_ms: u64, _cfg: &FskConfig) -> Option<Vec<u8>> {
+        self.recv(timeout_ms)
+    }
+
+    fn last_quality(&self) -> (f32, bool) {
+        self.last_quality
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -515,7 +627,7 @@ mod tests {
         let cfg = sim_cfg();
         let data: Vec<u8> = (0..200u8).map(|i| i.wrapping_mul(3)).collect();
         let mut ch = SimTransport::new(cfg.clone(), None, 0.0, 1);
-        let stats = run_sender(&data, &mut ch, 10, 5, &cfg, &cfg);
+        let stats = run_sender(&data, &mut ch, 10, 5, &cfg, &cfg, CHUNK);
         assert_eq!(ch.received, data, "clean transfer mismatch");
         assert_eq!(stats.retransmits, 0);
     }
@@ -525,7 +637,7 @@ mod tests {
         let cfg = sim_cfg();
         let data: Vec<u8> = (0..400usize).map(|i| (i as u8).wrapping_add(11)).collect();
         let mut ch = SimTransport::new(cfg.clone(), Some(20.0), 0.25, 7);
-        let stats = run_sender(&data, &mut ch, 10, 24, &cfg, &cfg);
+        let stats = run_sender(&data, &mut ch, 10, 24, &cfg, &cfg, CHUNK);
         assert_eq!(ch.received, data, "lossy transfer mismatch");
         assert!(stats.retransmits > 0, "ARQ never triggered");
     }
@@ -535,7 +647,7 @@ mod tests {
         let cfg = sim_cfg();
         let data: Vec<u8> = (0..100u8).collect();
         let mut ch = SimTransport::new(cfg.clone(), None, 0.0, 2);
-        run_sender(&data, &mut ch, 10, 3, &cfg, &cfg);
+        run_sender(&data, &mut ch, 10, 3, &cfg, &cfg, CHUNK);
         assert_eq!(ch.received.len(), data.len());
         assert_eq!(ch.received, data);
     }
