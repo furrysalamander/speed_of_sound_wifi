@@ -416,7 +416,7 @@ fn main() -> Result<()> {
     }
 
     let ps = payloads(&a);
-    if a.channels > 0 {
+    if a.channels > 0 || !a.carriers.is_empty() {
         return run_bank(&a, &ps);
     }
     let script = build_script(&cfg, &ps);

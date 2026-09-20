@@ -319,18 +319,21 @@ impl FskBankDemodulator {
         if regions.is_empty() {
             return None;
         }
-        for (start, end) in regions {
-            if let Some(mut d) = self.decode_burst(&self.buffer[start..end]) {
-                d.consumed_samples = end;
-                self.buffer.drain(..end);
-                return Some(d);
-            }
-            // Not a frame: drop and look again.
-            if end <= self.buffer.len() {
-                self.buffer.drain(..end);
-            }
+        let (start, end) = regions[0];
+        // If the region runs to the end of the buffer it may still be arriving;
+        // wait for its guard silence before judging it. Draining here would
+        // throw away the beginning of a real frame (its preamble).
+        let slack = self.env_win();
+        if end + slack >= self.buffer.len() {
             return None;
         }
+        if let Some(mut d) = self.decode_burst(&self.buffer[start..end]) {
+            d.consumed_samples = end;
+            self.buffer.drain(..end);
+            return Some(d);
+        }
+        // A complete region that is not a frame: drop it and keep listening.
+        self.buffer.drain(..end);
         None
     }
 
@@ -634,6 +637,26 @@ mod tests {
         assert_eq!(frames.len(), 1);
         assert_eq!(
             crate::physical::fsk::unwrap_frame(&frames[0].bytes),
+            Some(payload)
+        );
+    }
+
+    #[test]
+    fn streaming_reassembles_chunked_input() {
+        let c = FskBankConfig::default();
+        let payload: Vec<u8> = (0..16u8).collect();
+        let audio = c.encode_frame(&crate::physical::fsk::wrap_frame(&payload));
+        let mut dem = FskBankDemodulator::new(c);
+        let mut got = None;
+        for chunk in audio.chunks(500) {
+            if let Some(f) = dem.process_samples(chunk) {
+                got = Some(f);
+                break;
+            }
+        }
+        let f = got.expect("streaming bank decode failed");
+        assert_eq!(
+            crate::physical::fsk::unwrap_frame(&f.bytes),
             Some(payload)
         );
     }

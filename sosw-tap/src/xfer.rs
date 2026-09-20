@@ -506,7 +506,7 @@ pub struct BankTransport {
     cfg: FskBankConfig,
     last_quality: (f32, bool),
     pending: std::collections::VecDeque<Vec<u8>>,
-    dem: FskBankDemodulator,
+    collected: Vec<f32>,
     dump: Option<std::fs::File>,
 }
 
@@ -521,13 +521,12 @@ impl BankTransport {
             Some(p) => Some(std::fs::File::create(p)?),
             None => None,
         };
-        let dem = FskBankDemodulator::new(cfg.clone());
         Ok(Self {
             audio: crate::audio::DuplexAudio::new(tx, rx)?,
             cfg,
             last_quality: (0.0, true),
             pending: std::collections::VecDeque::new(),
-            dem,
+            collected: Vec::new(),
             dump,
         })
     }
@@ -537,7 +536,7 @@ impl Transport for BankTransport {
     fn send(&mut self, payload: &[u8]) {
         self.audio.clear_rx();
         self.pending.clear();
-        self.dem.reset();
+        self.collected.clear();
         let audio = self.cfg.encode_payload(payload);
         eprintln!(
             "[{}] TX(bank) {} samples ({:.1} s)",
@@ -565,8 +564,10 @@ impl Transport for BankTransport {
                 }
                 let _ = f.write_all(&bytes);
             }
-            if !chunk.is_empty() {
-                if let Some(fr) = self.dem.process_samples(&chunk) {
+            self.collected.extend(chunk);
+            if self.collected.len() >= self.cfg.preamble_samples() {
+                let dem = FskBankDemodulator::new(self.cfg.clone());
+                for fr in dem.decode_capture(&self.collected) {
                     if let Some(p) = fsk::unwrap_frame(&fr.bytes) {
                         eprintln!(
                             "[{}] RX(bank) frame (kind={}) minSNR={:.1}dB meanSNR={:.1}dB",
@@ -576,8 +577,12 @@ impl Transport for BankTransport {
                             fr.mean_snr_db
                         );
                         self.last_quality = (fr.min_snr_db, fr.fec_ok);
-                        return Some(p);
+                        self.pending.push_back(p);
                     }
+                }
+                if !self.pending.is_empty() {
+                    self.collected.clear();
+                    return self.pending.pop_front();
                 }
             }
             if start.elapsed() > timeout {

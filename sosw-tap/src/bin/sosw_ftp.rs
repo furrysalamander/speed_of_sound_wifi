@@ -76,6 +76,9 @@ struct Args {
     /// Bank channels are 2-FSK (default).
     #[arg(long, default_value_t = 2)]
     tones: usize,
+    /// Bank channel count when no explicit --carriers list is given.
+    #[arg(long, default_value_t = 0)]
+    channels: usize,
     /// Payload bytes per ARQ chunk.
     #[arg(long, default_value_t = xfer::CHUNK)]
     chunk: usize,
@@ -111,7 +114,7 @@ fn make_ack_cfg(a: &Args) -> FskConfig {
 
 fn make_bank_cfg(a: &Args) -> FskBankConfig {
     FskBankConfig {
-        n_channels: a.carriers.len(),
+        n_channels: if a.carriers.is_empty() { a.channels } else { a.carriers.len() },
         tones_per_channel: a.tones,
         symbol_samples: (a.symbol_ms as usize * SR as usize) / 1000,
         carrier_freqs: a.carriers.clone(),
@@ -129,7 +132,7 @@ fn main() -> Result<()> {
     let a = Args::parse();
     let cfg = make_cfg(&a);
     let ack_cfg = make_ack_cfg(&a);
-    let use_bank = !a.carriers.is_empty();
+    let use_bank = !a.carriers.is_empty() || a.channels > 0;
     match a.mode.as_str() {
         "sim" => {
             let data: Vec<u8> = (0..a.bytes).map(|i| (i as u8).wrapping_mul(37).wrapping_add(5)).collect();
