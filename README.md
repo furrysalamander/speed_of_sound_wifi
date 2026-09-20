@@ -218,16 +218,24 @@ kHz, repeatable). A ~200 Hz null spacing implies a ~5 ms reflection.
 
 ### Carrier-selective bank (higher-rate path)
 
-`sosw-core/src/physical/fsk_bank.rs` now supports an explicit carrier list, and
-`sosw-tap/src/bin/fsk_bench.rs --carriers ...` sounds/uses it. Per-channel
-preamble SNR and match fraction are reported (`--diag`). Six carriers are solid
-in **both** directions (1.0/3.0/4.6/8.2/8.6/9.0 kHz); the 6-carrier bank
-decodes with **100% conditional success** at payload 16 and ~75% at payload 32
-(long frames lose per-channel calibration, so short chunks are used).
+`sosw-core/src/physical/fsk_bank.rs` supports an explicit carrier list and
+per-channel sounding (`fsk_bench --carriers/--channels --diag`).
 
-Status: the bank PHY and sounding are proven; `xfer::BankTransport` and
-`sosw_ftp --carriers` are wired but the bank ARQ receiver is not yet decoding
-reliably (remaining bug). Realistic target ~3× the single-stream rate.
+**Measured result: the parallel bank does NOT work cross-machine.** It decodes
+in software and through the digital monitor, and self-loopback at 16ch/20 ms
+(100% conditional), but giratina→deoxys gives **0 valid frames** and
+`xfer::BankTransport` cannot decode it. The summed multi-tone signal has a
+varying envelope, which the capture path's AGC/limiter and the room's notches
+corrupt; the **constant-envelope** single-stream FSK does not suffer this.
+
+(An earlier "6-carrier bank decodes 100%" claim was a false positive: the
+`fsk_bench` bank path was only triggered by `--channels`, so `--carriers` runs
+were silently single-stream. That trigger is fixed.)
+
+Consequence: with this hardware and room, the working acoustic PHY is
+single-stream non-coherent FSK, capped at ~200 bps raw by the ~200 Hz notch
+spacing. A higher rate would need a **constant-envelope wideband** scheme
+(e.g. chirp spread spectrum) or a different capture path — not parallel FSK.
 
 ### Achieved rates (self-loopback, FEC on)
 
