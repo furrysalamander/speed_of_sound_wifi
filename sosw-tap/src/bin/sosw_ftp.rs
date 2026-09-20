@@ -54,9 +54,12 @@ struct Args {
     tx_device: Option<String>,
     #[arg(long)]
     rx_device: Option<String>,
-    /// Per-exchange receive timeout.
+    /// Receiver's listen window (must exceed one DATA frame).
     #[arg(long, default_value_t = 14000)]
     timeout_ms: u64,
+    /// Sender's wait for one ACK. Short, because latency is now ~120 ms.
+    #[arg(long, default_value_t = 3000)]
+    ack_timeout_ms: u64,
     #[arg(long, default_value_t = 6)]
     max_retries: usize,
     /// Receiver idle rounds before giving up.
@@ -135,7 +138,7 @@ fn main() -> Result<()> {
                 cfg.raw_bps()
             );
             let start = Instant::now();
-            let stats = run_sender(&data, &mut t, a.timeout_ms, a.max_retries, &cfg, &ack_cfg);
+            let stats = run_sender(&data, &mut t, a.ack_timeout_ms, a.max_retries, &cfg, &ack_cfg);
             let dur = start.elapsed().as_secs_f32();
             println!(
                 "done: {} chunks, {} retransmits, {} timeouts in {:.1}s ({:.1} B/s)",

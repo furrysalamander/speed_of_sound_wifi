@@ -5,7 +5,7 @@
 
 use sosw_core::physical::fsk::{self, FskConfig, FskDemodulator};
 
-pub const CHUNK: usize = 64;
+pub const CHUNK: usize = 128;
 const KIND_DATA: u8 = 0;
 const KIND_ACK: u8 = 1;
 const KIND_BYE: u8 = 2;
