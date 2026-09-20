@@ -23,6 +23,12 @@ pub struct XferStats {
 pub trait Transport {
     fn send(&mut self, payload: &[u8]);
     fn recv(&mut self, timeout_ms: u64) -> Option<Vec<u8>>;
+    /// Switch the modem configuration (used by link training mode negotiation).
+    fn set_config(&mut self, _cfg: FskConfig) {}
+    /// Quality of the most recently received frame: (min tone SNR dB, fec_ok).
+    fn last_quality(&self) -> (f32, bool) {
+        (0.0, true)
+    }
 }
 
 /// Transport payload: `[kind, seq_hi, seq_lo, total_hi, total_lo, len, data..]`.
@@ -76,16 +82,33 @@ pub fn run_sender<T: Transport>(
                 stats.retransmits += 1;
             }
             t.send(&frame);
-            match t.recv(timeout_ms) {
-                Some(resp) => {
-                    if let Some((kind, rseq, _, _)) = decode_transport(&resp) {
-                        if kind == KIND_ACK && rseq == seq {
-                            acked = true;
-                            break;
+            // Listen for the matching ACK until the attempt deadline. Frames
+            // that are not our ACK (e.g. our own delayed echo) are ignored
+            // rather than treated as a response, so we do not retransmit early.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+            loop {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    stats.timeouts += 1;
+                    break;
+                }
+                match t.recv(remaining.as_millis() as u64) {
+                    Some(resp) => {
+                        if let Some((kind, rseq, _, _)) = decode_transport(&resp) {
+                            if kind == KIND_ACK && rseq == seq {
+                                acked = true;
+                                break;
+                            }
                         }
                     }
+                    None => {
+                        stats.timeouts += 1;
+                        break;
+                    }
                 }
-                None => stats.timeouts += 1,
+            }
+            if acked {
+                break;
             }
         }
         if acked {
@@ -169,6 +192,7 @@ pub struct SimTransport {
     pub received: Vec<u8>,
     pub sent_frames: usize,
     pub dropped: usize,
+    last_quality: (f32, bool),
 }
 
 impl SimTransport {
@@ -183,6 +207,7 @@ impl SimTransport {
             received: Vec::new(),
             sent_frames: 0,
             dropped: 0,
+            last_quality: (0.0, true),
         }
     }
 
@@ -209,15 +234,17 @@ impl SimTransport {
         Some(a)
     }
 
-    fn demod(&self, audio: &[f32]) -> Option<Vec<u8>> {
+    fn demod(&self, audio: &[f32]) -> (Option<Vec<u8>>, f32, bool) {
         let dem = FskDemodulator::new(self.cfg.clone());
         let frames = dem.decode_capture(audio);
+        let mut best_snr = 0.0f32;
         for fr in frames {
+            best_snr = best_snr.max(fr.min_snr_db);
             if let Some(p) = fsk::unwrap_frame(&fr.bytes) {
-                return Some(p);
+                return (Some(p), fr.min_snr_db, fr.fec_ok);
             }
         }
-        None
+        (None, best_snr, false)
     }
 }
 
@@ -233,7 +260,8 @@ impl Transport for SimTransport {
             }
         };
         // Embedded receiver logic.
-        let decoded = self.demod(&heard);
+        let (decoded, snr, fec_ok) = self.demod(&heard);
+        self.last_quality = (snr, fec_ok);
         let response = decoded.and_then(|bytes| {
             let (kind, seq, _t, data) = decode_transport(&bytes)?;
             match kind {
@@ -260,7 +288,86 @@ impl Transport for SimTransport {
 
     fn recv(&mut self, _timeout_ms: u64) -> Option<Vec<u8>> {
         let audio = self.pending.take()?;
-        self.demod(&audio)
+        let (out, snr, ok) = self.demod(&audio);
+        self.last_quality = (snr, ok);
+        out
+    }
+
+    fn set_config(&mut self, cfg: FskConfig) {
+        self.cfg = cfg;
+    }
+
+    fn last_quality(&self) -> (f32, bool) {
+        self.last_quality
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Real acoustic endpoint.
+// ---------------------------------------------------------------------------
+
+pub struct AudioTransport {
+    audio: crate::audio::DuplexAudio,
+    cfg: FskConfig,
+    last_quality: (f32, bool),
+}
+
+impl AudioTransport {
+    pub fn new(tx: Option<&str>, rx: Option<&str>, cfg: FskConfig) -> anyhow::Result<Self> {
+        Ok(Self {
+            audio: crate::audio::DuplexAudio::new(tx, rx)?,
+            cfg,
+            last_quality: (0.0, true),
+        })
+    }
+}
+
+impl Transport for AudioTransport {
+    fn send(&mut self, payload: &[u8]) {
+        let audio = self.cfg.encode_payload(payload);
+        eprintln!(
+            "  TX {} samples ({:.1} s)",
+            audio.len(),
+            audio.len() as f32 / 48_000.0
+        );
+        self.audio.play_blocking(&audio, std::time::Duration::from_millis(50));
+        // Drop our own delayed echo so it does not crowd the listen window.
+        self.audio.clear_rx();
+    }
+
+    fn recv(&mut self, timeout_ms: u64) -> Option<Vec<u8>> {
+        let mut dem = FskDemodulator::new(self.cfg.clone());
+        self.audio.clear_rx();
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_millis(timeout_ms);
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let chunk = self.audio.take_rx();
+            if !chunk.is_empty() {
+                if let Some(fr) = dem.process_samples(&chunk) {
+                    if let Some(p) = fsk::unwrap_frame(&fr.bytes) {
+                        eprintln!(
+                            "  RX frame (kind={}) minSNR={:.1}dB",
+                            p.first().copied().unwrap_or(255),
+                            fr.min_snr_db
+                        );
+                        self.last_quality = (fr.min_snr_db, fr.fec_ok);
+                        return Some(p);
+                    }
+                }
+            }
+            if start.elapsed() > timeout {
+                return None;
+            }
+        }
+    }
+
+    fn set_config(&mut self, cfg: FskConfig) {
+        self.cfg = cfg;
+    }
+
+    fn last_quality(&self) -> (f32, bool) {
+        self.last_quality
     }
 }
 

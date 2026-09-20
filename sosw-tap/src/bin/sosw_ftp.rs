@@ -11,10 +11,10 @@
 
 use anyhow::Result;
 use clap::Parser;
-use sosw_core::physical::fsk::{self, FskConfig, FskDemodulator};
-use sosw_tap::audio::DuplexAudio;
-use sosw_tap::xfer::{self, run_receiver, run_sender, SimTransport, Transport};
-use std::time::{Duration, Instant};
+use sosw_core::physical::fsk::FskConfig;
+use sosw_tap::xfer::{self, run_receiver, run_sender, AudioTransport, SimTransport};
+use std::time::Instant;
+
 
 const SR: u32 = 48_000;
 
@@ -74,64 +74,9 @@ fn make_cfg(a: &Args) -> FskConfig {
         guard_samples: (a.guard_ms as usize * SR as usize) / 1000,
         rs_nsym: a.rs_nsym,
         fec_data_block: a.fec_block,
-        // Transport frames are 6 + CHUNK bytes; round up with margin.
-        payload_size: xfer::CHUNK + 16,
+        // Transport frames are 6 + CHUNK bytes; keep the padding tight.
+        payload_size: xfer::CHUNK + 8,
         ..FskConfig::default()
-    }
-}
-
-/// Acoustic endpoint: each `send` plays one frame; each `recv` listens for one.
-struct AcousticTransport {
-    audio: DuplexAudio,
-    cfg: FskConfig,
-}
-
-impl AcousticTransport {
-    fn new(a: &Args, cfg: FskConfig) -> Result<Self> {
-        Ok(Self {
-            audio: DuplexAudio::new(a.tx_device.as_deref(), a.rx_device.as_deref())?,
-            cfg,
-        })
-    }
-}
-
-impl Transport for AcousticTransport {
-    fn send(&mut self, payload: &[u8]) {
-        let audio = self.cfg.encode_payload(payload);
-        eprintln!(
-            "  TX {} samples ({:.1} s)",
-            audio.len(),
-            audio.len() as f32 / SR as f32
-        );
-        self.audio.play_blocking(&audio, Duration::from_millis(50));
-        // Drop our own delayed echo so it does not crowd the listen window.
-        self.audio.clear_rx();
-    }
-
-    fn recv(&mut self, timeout_ms: u64) -> Option<Vec<u8>> {
-        let mut dem = FskDemodulator::new(self.cfg.clone());
-        self.audio.clear_rx();
-        let start = Instant::now();
-        let timeout = Duration::from_millis(timeout_ms);
-        loop {
-            std::thread::sleep(Duration::from_millis(50));
-            let chunk = self.audio.take_rx();
-            if !chunk.is_empty() {
-                if let Some(fr) = dem.process_samples(&chunk) {
-                    if let Some(p) = fsk::unwrap_frame(&fr.bytes) {
-                        eprintln!(
-                            "  RX frame (kind at byte0={}) minSNR={:.1}dB",
-                            p.first().copied().unwrap_or(255),
-                            fr.min_snr_db
-                        );
-                        return Some(p);
-                    }
-                }
-            }
-            if start.elapsed() > timeout {
-                return None;
-            }
-        }
     }
 }
 
@@ -167,7 +112,7 @@ fn main() -> Result<()> {
         "send" => {
             let path = a.file.as_deref().ok_or_else(|| anyhow::anyhow!("--file required"))?;
             let data = std::fs::read(path)?;
-            let mut t = AcousticTransport::new(&a, cfg.clone())?;
+            let mut t = AudioTransport::new(a.tx_device.as_deref(), a.rx_device.as_deref(), cfg.clone())?;
             println!(
                 "sending {} bytes ({} chunks, {} bps raw) ...",
                 data.len(),
@@ -188,7 +133,7 @@ fn main() -> Result<()> {
         }
         "recv" => {
             let path = a.out.as_deref().unwrap_or("received.bin");
-            let mut t = AcousticTransport::new(&a, cfg.clone())?;
+            let mut t = AudioTransport::new(a.tx_device.as_deref(), a.rx_device.as_deref(), cfg.clone())?;
             println!("listening for transfer (timeout {} ms) ...", a.timeout_ms);
             let (data, stats) = run_receiver(&mut t, a.timeout_ms, a.max_rounds);
             std::fs::write(path, &data)?;
