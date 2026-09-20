@@ -363,12 +363,16 @@ impl FskBankDemodulator {
         let mut sorted = env.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let pk = sorted[sorted.len() - 1].max(1e-12);
-        let mut fl = sorted[0];
+        // Floor from a low percentile, NOT the minimum: a single quiet sample
+        // in a noisy recording would drag the minimum to ~0 and make the
+        // threshold too low, so an ambient-filled guard never registers as
+        // silence and consecutive frames merge into one region.
+        let mut fl = sorted[sorted.len() / 10];
         if fl > pk * 0.5 {
             fl = 0.0;
         }
-        let thr = (fl * 4.0).max(pk * 0.03).max(1e-9);
-        let thr_start = (fl * 8.0).max(pk * 0.1).max(thr);
+        let thr = (fl * 2.0).max(pk * 0.05).max(1e-9);
+        let thr_start = (fl * 3.0).max(pk * 0.12).max(thr);
         let gap_tol = win * 3;
         let mut out = Vec::new();
         let mut i = 0;

@@ -557,16 +557,17 @@ impl FskDemodulator {
         // floor must not be mistaken for the signal. Anchor the thresholds to
         // a high percentile as well and take whichever is more discriminating.
         let peak = sorted[(sorted.len() * 99 / 100).min(sorted.len() - 1)].max(1e-12);
-        // Use the true minimum for the floor: a frame with a short guard is
-        // >95% signal, so a percentile would mistake the signal for the floor.
-        // If even the minimum is near the peak there is no silence at all, in
-        // which case anchor purely to the peak.
-        let mut floor = sorted[0].max(1e-12);
+        // Floor from a low percentile, NOT the minimum: one quiet sample in a
+        // noisy recording drags the minimum to ~0 and makes the threshold too
+        // low, so an ambient-filled guard never registers as silence and
+        // consecutive frames merge. If the floor is near the peak there is no
+        // silence at all, so anchor purely to the peak.
+        let mut floor = sorted[sorted.len() / 20].max(1e-12);
         if floor > peak * 0.5 {
             floor = 0.0;
         }
-        let thr = (floor * 4.0).max(peak * 0.02);
-        let thr_start = (floor * 8.0).max(peak * 0.08).max(thr);
+        let thr = (floor * 2.0).max(peak * 0.05);
+        let thr_start = (floor * 3.0).max(peak * 0.12).max(thr);
         // A gap must be a real silence run, not a one-window ripple.
         let gap_tol = env_win * 3;
 
