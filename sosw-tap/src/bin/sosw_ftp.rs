@@ -90,8 +90,9 @@ fn make_ack_cfg(a: &Args) -> FskConfig {
     FskConfig {
         // ACKs are short: a small preamble and CRC-only keep their air time
         // (and therefore the half-duplex turnaround) small.
-        preamble_symbols: 12,
-        rs_nsym: 0,
+        preamble_symbols: 16,
+        rs_nsym: 4,
+        fec_data_block: 16,
         payload_size: 16,
         ..make_cfg(a)
     }
