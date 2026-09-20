@@ -10,13 +10,57 @@ The modem works correctly in software across **all** tested parameter combinatio
 
 ## OTA Preset Validation (Rust)
 
+Current status (2026-09-19): **digital** (monitor) loopbacks pass 100% on both
+machines; **acoustic** loopback and cross-machine OFDM decode **0%** at all
+tested levels, presets, and CP lengths (32–4800). The older "all 5 presets
+100% RS-correctable" acoustic result is **historical and not reproducible** in
+the current setup. See `README.md` → "Link Status (measured 2026-09-19)".
+
 ```bash
 cargo run --release -p sosw-cli --bin ota-validate -- --preset <name> --frames 20 --tx-device <tx> --rx-device <rx>
 ```
 
-All 5 presets verified at **100% RS-correctable** on 30-frame OTA loopback runs (ALC1220 speaker → USB PnP mic). See `AGENTS.md` for detailed results.
+## Tone Sweep — 2026-09-19 (current hardware)
 
-## Over-the-Air Sweep (Python)
+Per-tone SNR measured with `scripts/freq_sweep.py` (500 ms tones, 250 ms gaps),
+playback and capture via `pw-play`/`pw-record`. Table shows SNR (dB) at each
+frequency for each of the four paths.
+
+| freq | giratina self | deoxys self | gir→deoxys | deoxys→gir |
+|------|---------------|-------------|------------|------------|
+| 2 kHz | 61 | 41 | 52 | 21 |
+| 4 kHz | 61 | 47 | 47 | 49 |
+| 6 kHz | 44 | 34 | 43 | 47 |
+| 8 kHz | 39 | 44 | 37 | 40 |
+| 10 kHz | 47 | 51 | 45 | 46 |
+| 12 kHz | 43 | 56 | 45 | 30 |
+| 14 kHz | 44 | 56 | 52 | 44 |
+| 16 kHz | 37 | 58 | 41 | 36 |
+| 18 kHz | 43 | 52 | 42 | 41 |
+| 20 kHz | 37 | 39 | 38 | 38 |
+| 22 kHz | 41 | 33 | 37 | 31 |
+
+Observation: **all four paths carry 2–22 kHz at ≥21 dB SNR, and ≥30 dB at nearly
+every tone.** The tone *level* tilts by roughly 30 dB from 2 kHz to 22 kHz, but
+the noise floor falls with it, so SNR stays high. This contradicts the earlier
+note in `checkpoint_20240610_usb_mic_500baud_max.json` that the USB mic "rolls
+off above 3000 Hz"; no such rolloff was observed in this measurement.
+
+Supporting observation: giratina capture transfer curve (ALC1220 → USB mic,
+single 2 kHz tone) is linear only to input ≈0.1 and saturates at output ≈1.16.
+
+Acoustic OFDM per-subcarrier SNR measured 3.1 / 3.2 / 3.2 dB at TX gains
+2 / 4 / 6 (RX RMS 0.012 / 0.023 / 0.035) — flat with level, i.e. a
+signal-proportional impairment rather than additive noise. The mechanism has not
+been confirmed.
+
+## Over-the-Air Sweep (Python, June 2026 — historical)
+
+> These results are from June 2026 and are retained for reference. As of
+> 2026-09-19 the same Python code (`examples/demo_pipeline`) decodes **0 bytes**
+> over the air via the USB mic and 2811 bps through the monitor; the Rust modem
+> likewise fails acoustically. Do not read the numbers below as a current
+> baseline.
 
 ```bash
 python -m examples.ota_freq_sweep --frames 10

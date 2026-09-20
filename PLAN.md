@@ -2,7 +2,13 @@
 
 > **Status: Implemented.** All modules (tap, phy, mac, fragment) are built and
 > integrated. CSMA/CA state machine runs with per-fragment ACK and exponential
-> backoff. Remaining work: real-world multi-node testing, RTS/CTS, echo
+> backoff, and is exercised by the `mock_tap_loopback` test.
+>
+> **Blocker for end-to-end use (2026-09-19):** the MAC depends on the acoustic
+> OFDM link, which currently decodes 0% over the air in the dev setup (it passes
+> software and digital-monitor loopbacks). Until the PHY decodes acoustically,
+> real-world multi-node testing cannot run. See `README.md` →
+> "Link Status (measured 2026-09-19)". Remaining design work: RTS/CTS, echo
 > cancellation for full-duplex.
 
 ## Goal
@@ -101,10 +107,10 @@ Total: 4 bytes
 States: IDLE → SENSE → BACKOFF → TX_FRAGMENT → WAIT_ACK → (next frag / done)
 
 Per-fragment procedure:
-  1.  DIFS wait: channel must be clear for DIFS duration (300 ms)
+  1.  DIFS wait: channel must be clear for DIFS duration (600 ms)
   2.  Backoff: random(CW) × SLOT (60 ms), decrement only when idle
   3.  Transmit: modulate fragment → play audio output
-  4.  WAIT_ACK: listen for ACK frame (timeout = 600 ms)
+  4.  WAIT_ACK: listen for ACK frame (timeout = 2000 ms)
   5.  ACK received → next fragment
   6.  Timeout → CW = min(CW×2, CWmax), retry (max 5)
   7.  Exhausted → drop the Ethernet frame
@@ -132,11 +138,11 @@ Receiving:
 |--------------|---------|---------------------------------|
 | OFDM frame   | ~258 ms | 8 preamble + 35 data symbols    |
 | ACK frame    | ~54 ms  | 8 preamble + 1 data symbol      |
-| DIFS         | 300 ms  | Clear-channel observation       |
+| DIFS         | 600 ms  | Clear-channel observation       |
 | SLOT         | 60 ms   | Backoff slot duration           |
-| CWmin        | 2 slots | Initial contention window       |
-| CWmax        | 32 slots| Maximum contention window       |
-| ACK timeout  | 600 ms  | Per-fragment ACK wait           |
+| CWmin        | 4 slots | Initial contention window       |
+| CWmax        | 64 slots| Maximum contention window       |
+| ACK timeout  | 2000 ms | Per-fragment ACK wait           |
 | Max retries  | 5       | Per-fragment retransmit limit   |
 
 ### CLI

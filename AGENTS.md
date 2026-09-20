@@ -38,6 +38,7 @@ cargo run -p sosw-tap -- serve --tap sosw0 --preset default
 | Preamble | `src/physical/preamble.rs` | Preamble gen (seed=42), cross-correlation |
 | OFDM Mod | `src/physical/ofdm_mod.rs` | IFFT, CP, raised-cosine, normalization |
 | OFDM Demod | `src/physical/ofdm_demod.rs` | Timing, channel est, DD phase tracking |
+| DTMF | `src/physical/dtmf.rs` | DTMF tone-pair encode + grid-locked decode (control channel) |
 | Scrambler | `src/link/scrambler.rs` | ChaCha12 XOR (seed=12345) |
 | CRC | `src/link/crc.rs` | CRC-32 (Ethernet/ZIP polynomial) |
 | RS FEC | `src/link/fec.rs` | RS(255,223) encode/decode via `reed-solomon` crate |
@@ -52,6 +53,7 @@ cargo run -p sosw-tap -- serve --tap sosw0 --preset default
 | TAP | `src/tap.rs` | TAP device wrapper (tappers crate) |
 | PHY | `src/phy.rs` | Audio I/O + OFDM modem bridge |
 | MAC | `src/mac.rs` | CSMA/CA state machine |
+| Link | `src/link.rs` | DTMF link-training handshake framing (SYNC/kind/node/param/CRC) |
 | Fragment | `src/fragment.rs` | Ethernet fragmentation/reassembly |
 
 ## WASM Web App (`sosw-web`)
@@ -68,7 +70,8 @@ cargo run -p sosw-tap -- serve --tap sosw0 --preset default
 
 ## Test Results
 
-```bash
+```
+sosw-core lib (dtmf) ............. 7 passed
 tests/crc_tests.rs ............... 9 passed
 tests/scrambler_tests.rs ......... 9 passed
 tests/fec_tests.rs ............... 5 passed
@@ -79,9 +82,21 @@ tests/ofdm_roundtrip.rs .......... 4 passed
 tests/param_sweep.rs ............ 4 passed  (software sweep: FFT 128-512, CP 16-64, SC 1-127)
 tests/debug_fft.rs .............. 1 passed
 tests/debug_preamble.rs ......... 1 passed
-Fragment tests (sosw-tap) ....... 6 passed
-Total: 72 tests  (plus OTA: 600/600 frames, 5 presets × 120 frames, 100% RS-correctable)
+sosw-tap lib (link/mac/fragment) 16 passed
+Total: 89 tests  (1 mock_tap_loopback test ignored)
 ```
+
+The `dtmf` and `link` tests cover grid-locked DTMF decoding (short symbols,
+capture offset, noise rejection) and link-frame recovery with dropped,
+inserted, and substituted symbols at every position.
+
+**OTA / acoustic status (2026-09-19):** software and digital (monitor) loopbacks
+pass 100%. Acoustic OFDM — and time-differential OFDM and single-carrier QPSK —
+do **not** decode over the air in the current setup, on either machine, at any
+tested level, preset, or CP. The DTMF control-channel handshake does work
+cross-machine. See `README.md` → "Link Status" for the measured evidence. Older
+"100% RS-correctable" acoustic tables below are **historical and not
+reproducible now**.
 
 ## Config Presets
 
@@ -95,7 +110,17 @@ Total: 72 tests  (plus OTA: 600/600 frames, 5 presets × 120 frames, 100% RS-cor
 | Ultrasonic | 256 | 32 | 80–120 | 15.0–22.5 kHz | 167 | 51 | 354 ms | 13.7 kbps |
 | Ultrawide | 256 | 16 | 5–110 | 0.9–20.6 kHz | 176 | 20 | 159 ms | 37.4 kbps |
 
-All presets verified by software roundtrip test (`param_sweep.rs`), OTA validation (`ota-validate`), and Phy API loopback (`latency_test`).
+All presets pass the software roundtrip test (`param_sweep.rs`). As of 2026-09-19
+the digital (monitor) loopback passes at 100% but the acoustic OTA loopback does
+not decode; the prior OTA verification of these presets is **historical and not
+reproducible** in the current setup (see "OTA Validation" below).
+
+`Config` also has a `differential: bool` field (serde-defaulted) that switches to
+**time-differential** OFDM: data rides in the phase difference between consecutive
+OFDM symbols on the same subcarrier, so a static channel needs no absolute
+estimate. `with_layout(fft, cp, sc_min, sc_max, rs_nsym, payload)` rebuilds a
+layout and auto-fits `data_symbols_per_frame`. `ota-validate` exposes both via
+`--differential` and the layout flags.
 
 ## Debug Tab Features
 
@@ -107,7 +132,27 @@ All presets verified by software roundtrip test (`param_sweep.rs`), OTA validati
 
 ## OTA Validation (Rust)
 
-Tested with ALC1220 analog speaker output → USB PnP Audio Device mic (loopback, frames separated by `sym_dur` silence). 30 frames per preset, `consumed_samples` stride for alignment convergence.
+### Current status (2026-09-19)
+
+- **Digital** loopback (each machine's output → its own PipeWire monitor), 20
+  frames: **100% RS-correctable** on both giratina and deoxys.
+- **Software** loopback (`ota-validate --snr-db <n>`): **100%**.
+- **Acoustic** loopback and cross-machine, both directions: **0% RS-correctable**
+  across tested levels (sink 0.30–1.00, TX gain 1–18), all presets, and CP
+  32–4800. Time-differential OFDM and single-carrier QPSK also fail acoustically
+  while passing digitally.
+- The Python reference (`examples/demo_pipeline`) fails over the air now (0
+  bytes) and passes via the monitor (2811 bps).
+- Measured: acoustic per-subcarrier SNR 3.1/3.2/3.2 dB at TX gains 2/4/6 (does
+  not improve with level); capture transfer curve linear to input ≈0.1 then
+  saturating at ≈1.16; tone sweep carries 2–22 kHz at ≥21 dB SNR on all four
+  paths (≥30 dB at nearly every tone); clock offset 6.4 ppm. See `README.md` →
+  "Link Status" for tables.
+
+### Historical results (June 2026 — not reproducible)
+
+The table below was recorded in June 2026 and is retained for reference. It is
+**not reproducible now** in the current physical setup, with either modem.
 
 | Preset | SC Range | RS-Correctable | Notes |
 |--------|----------|---------------|-------|
@@ -116,8 +161,6 @@ Tested with ALC1220 analog speaker output → USB PnP Audio Device mic (loopback
 | Robust | 20–120 | **100%** | 30/30, <10 err/frame |
 | Ultrasonic | 80–120 | **100%** | 30/30, <6 err/frame |
 | Ultrawide | 5–110 | **100%** | 30/30, <18 err/frame |
-
-All 5 presets verified with OTA loopback — **100% RS-correctable** on 30-frame runs.
 
 ### Key Fixes
 

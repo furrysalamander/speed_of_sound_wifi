@@ -19,6 +19,7 @@ Acoustic OFDM data modem — transmit data through sound using a speaker and mic
 │  │  ofdm_mod│  crc         │  FFT/CP/SC/freq derivation    │  │
 │  │  ofdm_dem│  fec(RS)     │  symbol_rate, theoretical_bps  │  │
 │  │  preamble│  frame       │                                │  │
+│  │  dtmf    │              │                                │  │
 │  └──────────┴──────────────┴──────────────────────────────┘  │
 ├──────────────────────────────────────────────────────────────┤
 │  Audio: cpal (desktop)  /  Web Audio API (WASM)              │
@@ -34,23 +35,133 @@ TX: Bytes → Scramble(ChaCha12) → Pack bits → QPSK map(2 bits/sc)
 
 RX: Audio → Cross-correlation → Preamble detect
     → Channel estimate + CFO estimate → Per-sym FFT
-    → Decision-directed phase tracking → Equalization
-    → QPSK demap → Unpack bits → Descramble → Bytes
+    → Decision-directed phase correction → Equalization → QPSK demap
+    → Unpack bits → Descramble → Bytes
     → FrameParser (sync → RS(255,223) FEC → CRC-32 verify)
 ```
+
+An optional **time-differential** mode (`Config::differential`) carries data in
+the phase difference between consecutive OFDM symbols on the same subcarrier, so
+a static channel needs no absolute estimate. It passes software and digital
+tests but not the current acoustic path (see [Link Status](#link-status-measured-2026-09-19)).
+
+The **DTMF control channel** (`sosw-tap::link`) is independent of the OFDM modem
+and is the only channel verified working across machines.
 
 ### Crate Map
 
 | Crate | Purpose | Key Dependencies |
 |-------|---------|-----------------|
-| `sosw-core` | Core modem library (no I/O) | `rustfft`, `ndarray`, `reed-solomon`, `serde` |
+| `sosw-core` | Core modem library + DTMF control codec (no I/O) | `rustfft`, `ndarray`, `reed-solomon`, `serde` |
 | `sosw-cli` | Desktop CLI (TX/RX/test/ota-validate) | `sosw-core`, `clap`, `cpal` |
 | `sosw-web` | WASM browser app (RX/TX/Debug tabs) | `sosw-core`, `leptos`, `web-sys` |
-| `sosw-tap` | Ethernet-over-sound (CSMA/CA MAC) | `sosw-core`, `tappers`, `cpal`, `tokio` |
+| `sosw-tap` | Ethernet-over-sound (CSMA/CA MAC) + DTMF link handshake | `sosw-core`, `tappers`, `cpal`, `tokio` |
+
+## Control Channel (`sosw-tap::link`, `sosw-core::physical::dtmf`)
+
+A robust DTMF tone-pair control channel is used for link training. Each message
+is a 7-nibble frame (`SYNC, kind, node_hi, node_lo, param_hi, param_lo, crc`)
+transmitted with the configured repetition, and the decoder locks to the known
+symbol grid (fine phase search + hysteresis + noise-floor-relative threshold).
+
+```bash
+# A initiates, B responds
+sosw_link --role a --node-id 1
+sosw_link --role b --node-id 2
+```
+
+Defaults: 60 ms tone / 60 ms gap, repeat 2. `--symbol-ms --gap-ms --repeat
+--echo-tail-ms --turn-gap-ms` are configurable. This channel is verified working
+cross-machine; the OFDM data channel is not (see
+[Link Status](#link-status-measured-2026-09-19)).
+
+## Link Status (measured 2026-09-19)
+
+This section records what has actually been observed on the development machines
+(giratina: ALC1220 analog output + USB PnP Audio Device mic; deoxys: onboard
+speaker + Digital Microphone), so it supersedes older claims elsewhere in this
+document. Items marked *historical* are not reproducible in the current setup.
+
+### Verified working
+
+- **DTMF control-channel handshake across machines (`sosw_link`)**, both directions.
+  Repeated runs show `A: TX HELLO → RX HELLO_ACK → TX TRAIN → RX TRAIN_ACK →
+  LINK ESTABLISHED`, and the mirrored sequence on B, with every message decoded
+  on the first attempt.
+- **OFDM software loopback**: all `sosw-core` tests pass (`cargo test -p sosw-core`).
+- **OFDM digital loopback** through each machine's PipeWire monitor source
+  (`ota-validate --rx-device <...>.monitor`): **100% RS-correctable** on both
+  machines.
+- **Frequency sweep** (`scripts/freq_sweep.py`) carries **2–22 kHz with per-tone
+  SNR of at least 21 dB on all four paths** (≥30 dB at nearly every tone; the
+  21 dB low is deoxys→giratina at 2 kHz). See
+  [docs/frequency_sweep.md](docs/frequency_sweep.md).
+
+### Verified not working (acoustic)
+
+- **OFDM over the air** fails on all tested paths: giratina self-loopback,
+  deoxys self-loopback, and both cross-machine directions. 0% RS-correctable
+  across the tested output levels (sink 0.30–1.00, TX gain 1–18), all five
+  presets, and CP lengths 32–4800 samples.
+- **Time-differential OFDM** (channel-agnostic; data in consecutive-symbol phase
+  differences) and **single-carrier QPSK** (low PAPR, RRC-shaped) each decode on
+  the digital monitor but fail acoustically (0%).
+- **The legacy Python reference** (`examples/demo_pipeline`, the code used for the
+  historical video demo) also decodes **0 bytes** over the air now, while decoding
+  2811 bps through the monitor.
+
+### Measured characteristics
+
+Per-tone SNR (dB) from a 2–22 kHz sweep (500 ms tones):
+
+| freq | giratina self | deoxys self | gir→deoxys | deoxys→gir |
+|------|---------------|-------------|------------|------------|
+| 2 kHz | 61 | 41 | 52 | 21 |
+| 4 kHz | 61 | 47 | 47 | 49 |
+| 6 kHz | 44 | 34 | 43 | 47 |
+| 8 kHz | 39 | 44 | 37 | 40 |
+| 10 kHz | 47 | 51 | 45 | 46 |
+| 12 kHz | 43 | 56 | 45 | 30 |
+| 14 kHz | 44 | 56 | 52 | 44 |
+| 16 kHz | 37 | 58 | 41 | 36 |
+| 18 kHz | 43 | 52 | 42 | 41 |
+| 20 kHz | 37 | 39 | 38 | 38 |
+| 22 kHz | 41 | 33 | 37 | 31 |
+
+Capture level, giratina ALC1220 → USB mic, single 2 kHz tone:
+
+| input | output | gain |
+|-------|--------|------|
+| 0.02 | 0.22 | 20.7 dB |
+| 0.05 | 0.54 | 20.6 dB |
+| 0.10 | 1.00 | 20.0 dB |
+| 0.20 | 1.13 | 15.0 dB |
+| 0.40 | 1.17 | 9.3 dB |
+| 0.80 | 1.16 | 3.2 dB |
+
+The path is linear only up to input ≈ 0.1 and saturates at output ≈ 1.16.
+
+- Acoustic OFDM **per-subcarrier SNR is 3.1 / 3.2 / 3.2 dB** at TX gains
+  2 / 4 / 6 (RX RMS 0.012 / 0.023 / 0.035) — it does not improve with level.
+- Clock offset (giratina USB mic vs ALC1220 output): **6.4 ppm**.
+- Cross-machine DTMF acoustic delay: **~3–5.7 s** observed (hosts NTP-synced to 18 ms).
+
+The measurements establish a **signal-proportional impairment** (not additive
+noise) plus a compressive capture curve. The mechanism has **not** been
+confirmed; the capture-path cause is a hypothesis, not a verified fact.
+
+### Not reproducible (historical)
+
+`README.md`, `AGENTS.md` and `docs/frequency_sweep.md` previously reported
+"100% RS-correctable" acoustic OFDM for all five presets. Those results are from
+June 2026 and are **not reproducible now**, with either the Rust modem or the
+Python reference, in the current physical setup (the microphone was moved between
+then and now).
 
 ## Config Presets
 
-All presets verified OTA: **100% RS-correctable** on 30-frame loopback runs (ALC1220 speaker → USB PnP mic).
+Software and digital (monitor) loopbacks pass at 100%. Acoustic over-the-air
+decoding is not currently reproducible (see [Link Status](#link-status-measured-2026-09-19)).
 
 | Preset | FFT | CP | SC Range | Freq Range | Sym/s | Bitrate |
 |--------|-----|----|----------|------------|-------|---------|
@@ -114,11 +225,19 @@ cargo run --release -p sosw-cli --bin ota-validate -- \
     --tx-device "ALC1220" --rx-device "USB_PnP"
 ```
 
-All 5 presets verified at 100% RS-correctable (30 frames each) on ALC1220 speaker → USB PnP mic loopback.
+The tool also accepts `--fft --cp --sc-min --sc-max --rs --payload`
+(layout overrides) and `--differential` (time-differential OFDM), and reports
+measured goodput. As of 2026-09-19 the digital monitor path passes 100%; the
+acoustic path does not decode in the current setup (see
+[Link Status](#link-status-measured-2026-09-19)).
 
 ## Ethernet-over-Sound (`sosw-tap`)
 
 Bridges a Linux TAP interface to the OFDM audio modem. Shared-medium Ethernet with CSMA/CA — all devices communicate over sound.
+
+> **Note (2026-09-19):** the MAC is implemented and exercised by software/mock
+> tests, but end-to-end operation depends on the acoustic OFDM link, which does
+> not currently decode over the air. See [Link Status](#link-status-measured-2026-09-19).
 
 ```
 Linux TCP/IP stack → TAP interface → sosw-tap → OFDM modem → Speakers/Mic
@@ -143,7 +262,7 @@ ping 10.0.0.2
 
 ### MAC Layer
 
-- **CSMA/CA**: DIFS (300 ms), random backoff (4–64 slots × 60 ms), ACK timeout (700 ms)
+- **CSMA/CA**: DIFS (600 ms), random backoff (4–64 slots × 60 ms), ACK timeout (2000 ms)
 - **Fragmentation**: 1500-byte Ethernet frames split into 438-byte fragments (4 frags max), reassembled by (src_id, frame_id)
 - **Node addressing**: 1-byte node IDs (0–255), broadcast at MAC layer
 
@@ -162,13 +281,14 @@ Open `http://localhost:8080` after `trunk serve`. Grant microphone permission wh
 ## Testing
 
 ```bash
-# Rust unit tests (66+ tests)
+# Rust unit tests
 cargo test -p sosw-core
+cargo test -p sosw-tap
 
 # Software parameter sweep (FFT 128–512, CP 16–64, SC 1–127)
 cargo test -p sosw-core --test param_sweep -- --nocapture
 
-# OTA hardware validation
+# OTA hardware validation (see Link Status for current acoustic results)
 cargo run --release -p sosw-cli --bin ota-validate -- --preset default --frames 20
 
 # Python tests (legacy)
@@ -179,6 +299,7 @@ python -m pytest tests/ -v
 
 | Module | Tests | Description |
 |--------|-------|-------------|
+| `dtmf` (sosw-core lib) | 7 | DTMF encode/decode, grid lock, short symbols, noise rejection |
 | `crc_tests` | 9 | CRC-32 encode/verify/corruption |
 | `scrambler_tests` | 9 | ChaCha12 XOR, determinism, edge cases |
 | `fec_tests` | 5 | RS(255,223) encode/decode |
@@ -189,8 +310,8 @@ python -m pytest tests/ -v
 | `param_sweep` | 4 | Software sweep across parameter ranges |
 | `debug_fft` | 1 | FFT sanity check |
 | `debug_preamble` | 1 | Preamble cross-correlation |
-| `fragment` | 6 | sosw-tap Ethernet fragmentation tests |
-| **Total** | **72** | |
+| sosw-tap lib (`link`, `mac`, `fragment`) | 16 | DTMF link framing, CSMA/CA, fragmentation |
+| **Total** | **89** | (1 `mock_tap_loopback` test is ignored) |
 
 ## Project Structure
 
@@ -212,7 +333,8 @@ speed_of_sound_wifi/
 │       │   ├── qpsk.rs         # Gray-coded QPSK map/demap
 │       │   ├── preamble.rs     # Preamble gen (seed=42), cross-correlation
 │       │   ├── ofdm_mod.rs     # IFFT, CP, raised-cosine, normalization
-│       │   └── ofdm_demod.rs   # Timing, channel est, DD phase tracking, CFO
+│       │   ├── ofdm_demod.rs   # Timing, channel est, DD phase tracking, CFO
+│       │   └── dtmf.rs         # DTMF control codec (grid-locked decoder)
 │       └── link/
 │           ├── scrambler.rs    # ChaCha12 XOR (seed=12345)
 │           ├── crc.rs          # CRC-32 (Ethernet/ZIP polynomial)
@@ -223,7 +345,8 @@ speed_of_sound_wifi/
 │   ├── Cargo.toml
 │   └── src/
 │       ├── main.rs         # CLI: list-devices, tx, rx, test
-│       └── ota_validate.rs # OTA validation binary
+│       ├── ota_validate.rs # OTA validation binary (preset/layout/differential)
+│       └── bin/            # dtmf-tx, dtmf-rx (standalone DTMF tools)
 │
 ├── sosw-web/               # WASM web app (Leptos)
 │   ├── Cargo.toml
@@ -245,9 +368,12 @@ speed_of_sound_wifi/
 │       ├── tap.rs          # TAP device wrapper (tappers crate)
 │       ├── phy.rs          # Audio I/O + OFDM modem bridge
 │       ├── mac.rs          # CSMA/CA state machine
-│       └── fragment.rs     # Ethernet fragmentation/reassembly
+│       ├── link.rs         # DTMF link-training handshake framing
+│       ├── fragment.rs     # Ethernet fragmentation/reassembly
+│       └── bin/            # sosw_link, link_tx/rx/gen/probe, data_rx,
+│                           # frame_tx, sc_loopback, ota/phy/latency tests
 │
-├── src/                    # Legacy Python implementation (M-FSK)
+├── src/                    # Legacy Python implementation (M-FSK + OFDM)
 │   ├── config.py
 │   ├── main.py
 │   ├── audio/              # Audio I/O (sounddevice/PortAudio)
@@ -264,7 +390,16 @@ speed_of_sound_wifi/
 
 ## Legacy Python Implementation
 
-The `src/` directory contains the original Python implementation (M-FSK modulation, PyQtGraph GUI, file transfer protocol). This codebase is preserved for reference but is no longer the active development target. The Rust OFDM implementation in `sosw-core` is the canonical modem.
+The `src/` directory contains the original Python implementation (M-FSK **and**
+OFDM modulation, PyQtGraph GUI, file transfer protocol). It is preserved for
+reference; the Rust implementation in `sosw-core` is the active target.
+
+The Python OFDM modem is what `examples/demo_pipeline.py` (the historical
+open-air video demo) drives. As of 2026-09-19 that pipeline decodes **0 bytes
+over the air** via the USB mic (`--tx-device analog-stereo --rx-device
+USB_PnP`) while decoding 2811 bps through the monitor — i.e. it fails exactly
+like the Rust modem in the current setup (see
+[Link Status](#link-status-measured-2026-09-19)).
 
 ```bash
 # Python setup
