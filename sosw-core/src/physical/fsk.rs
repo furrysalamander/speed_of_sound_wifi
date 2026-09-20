@@ -17,8 +17,37 @@
 //!   per-tone gain tilt or small frequency offset cannot bias the decisions.
 
 use crate::bytes_to_bits;
+use crate::link::crc;
 use crate::physical::dtmf::goertzel;
 use std::f32::consts::PI;
+
+/// Wrap a payload for FSK transmission: `[len_hi, len_lo, payload..., crc32]`.
+/// The FSK preamble already provides frame sync, so this is all the framing the
+/// PHY needs; CRC-32 gives end-to-end integrity.
+pub fn wrap_frame(payload: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(payload.len() + 6);
+    v.push((payload.len() >> 8) as u8);
+    v.push((payload.len() & 0xFF) as u8);
+    v.extend_from_slice(payload);
+    crc::compute_and_append_crc(&mut v);
+    v
+}
+
+/// Recover the payload from wrapped bytes, verifying the CRC-32.
+pub fn unwrap_frame(bytes: &[u8]) -> Option<Vec<u8>> {
+    if bytes.len() < 6 {
+        return None;
+    }
+    let len = ((bytes[0] as usize) << 8) | bytes[1] as usize;
+    let end = 2usize.checked_add(len)?;
+    if end + 4 > bytes.len() {
+        return None;
+    }
+    if !crc::verify_crc32(&bytes[..end], &bytes[end..end + 4]) {
+        return None;
+    }
+    Some(bytes[2..end].to_vec())
+}
 
 /// Result of demodulating one FSK frame.
 #[derive(Clone, Debug)]
@@ -125,16 +154,26 @@ impl FskConfig {
         self.preamble_samples()
     }
 
-    /// Deterministic pseudo-random preamble covering the tone set.
+    /// Deterministic pseudo-random preamble that contains every tone about
+    /// equally often. Equal coverage lets the demodulator learn a per-tone
+    /// channel gain from the preamble, which is what lets M-FSK survive the
+    /// measured frequency selectivity beyond a ~350 Hz span.
     pub fn preamble(&self) -> Vec<u8> {
         let mut s = self.preamble_seed | 1;
         let mut out = Vec::with_capacity(self.preamble_symbols);
-        for _ in 0..self.preamble_symbols {
-            s ^= s << 13;
-            s ^= s >> 17;
-            s ^= s << 5;
-            out.push((s % self.m as u32) as u8);
+        while out.len() < self.preamble_symbols {
+            // Fisher-Yates shuffle of 0..M from the xorshift stream.
+            let mut perm: Vec<u8> = (0..self.m as u8).collect();
+            for i in (1..perm.len()).rev() {
+                s ^= s << 13;
+                s ^= s >> 17;
+                s ^= s << 5;
+                let j = (s as usize) % (i + 1);
+                perm.swap(i, j);
+            }
+            out.extend_from_slice(&perm);
         }
+        out.truncate(self.preamble_symbols);
         out
     }
 
@@ -238,26 +277,47 @@ impl FskConfig {
         out
     }
 
-    /// Decide one symbol from a window: `(symbol, confidence, snr_db)`.
-    pub fn detect_symbol(&self, window: &[f32]) -> (u8, f32, f32) {
+    /// Goertzel energy at every tone for one symbol window.
+    pub fn tone_energies(&self, window: &[f32]) -> Vec<f32> {
         let sr = self.sample_rate as f32;
+        (0..self.m)
+            .map(|i| goertzel(window, self.tone_freq(i), sr))
+            .collect()
+    }
+
+    fn decide(energies: &[f32]) -> (u8, f32, f32) {
+        let m = energies.len().max(2);
         let mut best = 0usize;
         let mut best_e = f32::MIN;
         let mut sum = 0.0f32;
-        let mut energies = Vec::with_capacity(self.m);
-        for i in 0..self.m {
-            let e = goertzel(window, self.tone_freq(i), sr);
-            energies.push(e);
+        for (i, &e) in energies.iter().enumerate() {
             sum += e;
             if e > best_e {
                 best_e = e;
                 best = i;
             }
         }
-        let mean_other = ((sum - best_e) / (self.m.max(2) - 1) as f32).max(1e-12);
+        let mean_other = ((sum - best_e) / (m - 1) as f32).max(1e-12);
         let snr_db = 10.0 * (best_e / mean_other).log10();
         let conf = best_e / sum.max(1e-12);
         (best as u8, conf, snr_db)
+    }
+
+    /// Decide one symbol from a window: `(symbol, confidence, snr_db)`.
+    pub fn detect_symbol(&self, window: &[f32]) -> (u8, f32, f32) {
+        Self::decide(&self.tone_energies(window))
+    }
+
+    /// Decide one symbol with per-tone gain correction, so a frequency-selective
+    /// channel (some tones attenuated) does not bias the decision.
+    pub fn detect_with_gains(&self, window: &[f32], gains: &[f32]) -> (u8, f32, f32) {
+        let e = self.tone_energies(window);
+        let corr: Vec<f32> = e
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| v / gains.get(i).copied().unwrap_or(1.0).max(1e-12))
+            .collect();
+        Self::decide(&corr)
     }
 }
 
@@ -446,17 +506,27 @@ impl FskDemodulator {
         }
         let off = best?.0;
 
-        // Slice the whole region on the winning grid.
-        let mut tx_symbols = Vec::new();
-        let mut snrs = Vec::new();
-        let mut confs = Vec::new();
-        let mut a = off;
-        while a + n <= region.len() {
-            let (sym, conf, snr) = self.cfg.detect_symbol(&region[a..a + n]);
+        // Estimate a per-tone gain from the preamble. Every tone appears about
+        // equally there, so accumulating the received energy at each known
+        // preamble tone gives a direct estimate of that tone's channel gain.
+        let mut gain_acc = vec![0.0f32; self.cfg.m];
+        let mut gain_cnt = vec![0usize; self.cfg.m];
+        let mut tx_symbols = Vec::with_capacity(pre.len());
+        let mut snrs = Vec::with_capacity(pre.len());
+        let mut confs = Vec::with_capacity(pre.len());
+        for (i, &ps) in pre.iter().enumerate() {
+            let a = off + i * n;
+            if a + n > region.len() {
+                break;
+            }
+            let e = self.cfg.tone_energies(&region[a..a + n]);
+            let (sym, conf, snr) = FskConfig::decide(&e);
             tx_symbols.push(sym);
             snrs.push(snr);
             confs.push(conf);
-            a += n;
+            let p = ps as usize;
+            gain_acc[p] += e[p];
+            gain_cnt[p] += 1;
         }
         if tx_symbols.len() < pre.len() {
             return None;
@@ -468,6 +538,41 @@ impl FskDemodulator {
             .count();
         if matches * 4 < pre.len() * 3 {
             return None;
+        }
+        let present_mean = {
+            let mut s = 0.0f32;
+            let mut c = 0usize;
+            for i in 0..self.cfg.m {
+                if gain_cnt[i] > 0 {
+                    s += gain_acc[i] / gain_cnt[i] as f32;
+                    c += 1;
+                }
+            }
+            if c > 0 {
+                s / c as f32
+            } else {
+                1.0
+            }
+        };
+        let gains: Vec<f32> = (0..self.cfg.m)
+            .map(|i| {
+                if gain_cnt[i] > 0 {
+                    (gain_acc[i] / gain_cnt[i] as f32).max(present_mean * 0.05)
+                } else {
+                    present_mean
+                }
+            })
+            .collect();
+
+        // Slice the rest of the region on the winning grid, correcting each
+        // tone by its learned gain.
+        let mut a = off + pre.len() * n;
+        while a + n <= region.len() {
+            let (sym, conf, snr) = self.cfg.detect_with_gains(&region[a..a + n], &gains);
+            tx_symbols.push(sym);
+            snrs.push(snr);
+            confs.push(conf);
+            a += n;
         }
 
         // Differential decode, carrying the last preamble symbol as reference.
@@ -616,6 +721,27 @@ mod tests {
         }
         let dem = FskDemodulator::new(c);
         assert!(dem.decode_capture(&audio).is_empty());
+    }
+
+    #[test]
+    fn per_tone_calibration_survives_multipath() {
+        // A two-path channel gives each tone a different static gain, creating
+        // a frequency-selective tilt across the 16-tone set. Per-tone
+        // calibration learned from the preamble must recover it.
+        let c = cfg(16, 960);
+        let payload: Vec<u8> = (0..16u8).collect();
+        let audio = c.encode_frame(&payload);
+        let d = 64usize;
+        let a = 0.55f32;
+        let rx: Vec<f32> = audio
+            .iter()
+            .enumerate()
+            .map(|(n, &s)| s + if n >= d { a * audio[n - d] } else { 0.0 })
+            .collect();
+        let dem = FskDemodulator::new(c);
+        let frames = dem.decode_capture(&rx);
+        assert_eq!(frames.len(), 1, "multipath frame not detected");
+        assert_eq!(frames[0].bytes, payload, "multipath payload mismatch");
     }
 
     #[test]
