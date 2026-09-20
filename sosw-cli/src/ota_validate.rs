@@ -31,11 +31,37 @@ struct Args {
     /// Dump generated TX audio as raw little-endian f32 for offline analysis
     #[arg(long)]
     dump_tx: Option<std::path::PathBuf>,
+    /// OFDM layout overrides (any of these triggers a refit of the frame)
+    #[arg(long)]
+    fft: Option<usize>,
+    #[arg(long)]
+    cp: Option<usize>,
+    #[arg(long)]
+    sc_min: Option<usize>,
+    #[arg(long)]
+    sc_max: Option<usize>,
+    #[arg(long)]
+    rs: Option<usize>,
+    #[arg(long)]
+    payload: Option<usize>,
+    /// Use differential subcarrier modulation (no absolute channel estimate)
+    #[arg(long)]
+    differential: bool,
 }
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    let config = Config::from_preset_name(&args.preset);
+    let mut config = Config::from_preset_name(&args.preset);
+    config.differential = args.differential;
+    if args.differential || args.fft.is_some() || args.cp.is_some() || args.sc_min.is_some() || args.sc_max.is_some() || args.rs.is_some() || args.payload.is_some() {
+        let fft = args.fft.unwrap_or(config.fft_size);
+        let cp = args.cp.unwrap_or(config.cp_length);
+        let sc_min = args.sc_min.unwrap_or(config.sc_min);
+        let sc_max = args.sc_max.unwrap_or(config.sc_max);
+        let rs = args.rs.unwrap_or(config.rs_nsym);
+        let payload = args.payload.unwrap_or(config.payload_size);
+        config = config.with_layout(fft, cp, sc_min, sc_max, rs, payload);
+    }
     let payload_size = config.payload_size;
     let tx_gain = args.gain;
     let n_frames = args.frames;
@@ -163,6 +189,16 @@ fn main() -> anyhow::Result<()> {
     let avg_err = if n_frames > 0 { total_diff_bytes as f64 / n_frames as f64 } else { 0.0 };
     eprintln!("  Raw frames: {}/{} = {:.1}% (avg {:.1} byte errors/frame)", matching_frames, n_frames, raw_pct, avg_err);
     eprintln!("  RS-correctable: {}/{} = {:.1}% (budget {} bytes/frame)", rs_matched, n_frames, rs_pct, rs_byte_budget);
+
+    let audio_dur = audio.len() as f64 / config.sample_rate as f64;
+    let goodput = rs_matched as f64 * config.payload_size as f64 * 8.0 / audio_dur;
+    eprintln!(
+        "  Layout: fft={} cp={} sc={}-{} ({:.0}-{:.0} Hz, {:.0} Hz BW) rs={} payload={} syms/frame={} theory={:.0} bps",
+        config.fft_size, config.cp_length, config.sc_min, config.sc_max,
+        config.frequency_min(), config.frequency_max(), config.occupied_bandwidth(),
+        config.rs_nsym, config.payload_size, config.data_symbols_per_frame, config.theoretical_bps(),
+    );
+    eprintln!("  Goodput: {:.0} bps ({} payload bytes RS-correct / {:.2}s)", goodput, rs_matched * config.payload_size, audio_dur);
 
     if rs_pct >= 90.0 {
         eprintln!("  Result: PASS (RS-correctable threshold >= 90%)");

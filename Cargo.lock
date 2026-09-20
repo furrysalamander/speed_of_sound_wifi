@@ -2177,6 +2177,7 @@ dependencies = [
  "cpal",
  "env_logger",
  "log",
+ "num-complex",
  "rand",
  "sosw-core",
  "tappers",

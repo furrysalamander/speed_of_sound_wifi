@@ -26,6 +26,9 @@ struct Args {
     payload_size: usize,
     #[arg(long)]
     dump_rx: Option<std::path::PathBuf>,
+    /// Demodulate a raw f32 capture instead of recording
+    #[arg(long)]
+    file: Option<std::path::PathBuf>,
 }
 
 fn find_input(host: &cpal::Host, name: &str) -> Result<cpal::Device> {
@@ -42,34 +45,40 @@ fn find_input(host: &cpal::Host, name: &str) -> Result<cpal::Device> {
 fn main() -> Result<()> {
     let args = Args::parse();
     let config = Config::from_preset_name(&args.preset);
-    let host = cpal::default_host();
-    let dev = match &args.rx_device {
-        Some(n) => find_input(&host, n)?,
-        None => host.default_input_device().ok_or_else(|| anyhow::anyhow!("no default input"))?,
-    };
-    let cfg_in = dev.default_input_config()?.config();
-    let ch = cfg_in.channels as usize;
-    eprintln!(
-        "data-rx: {} ({} ch, {} Hz, {:.1}s)",
-        dev.id().map(|i| format!("{}", i)).unwrap_or_default(), ch, cfg_in.sample_rate, args.duration
-    );
 
-    let buf: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
-    let b = buf.clone();
-    let stream = dev.build_input_stream::<f32, _, _>(cfg_in, move |data: &[f32], _: &cpal::InputCallbackInfo| {
-        if let Ok(mut v) = b.lock() {
-            if ch > 1 {
-                for f in data.chunks(ch) { v.push(f[0]); }
-            } else {
-                v.extend_from_slice(data);
+    let captured: Vec<f32> = if let Some(path) = &args.file {
+        let bytes = std::fs::read(path)?;
+        bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+    } else {
+        let host = cpal::default_host();
+        let dev = match &args.rx_device {
+            Some(n) => find_input(&host, n)?,
+            None => host.default_input_device().ok_or_else(|| anyhow::anyhow!("no default input"))?,
+        };
+        let cfg_in = dev.default_input_config()?.config();
+        let ch = cfg_in.channels as usize;
+        eprintln!(
+            "data-rx: {} ({} ch, {} Hz, {:.1}s)",
+            dev.id().map(|i| format!("{}", i)).unwrap_or_default(), ch, cfg_in.sample_rate, args.duration
+        );
+        let buf: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
+        let b = buf.clone();
+        let stream = dev.build_input_stream::<f32, _, _>(cfg_in, move |data: &[f32], _: &cpal::InputCallbackInfo| {
+            if let Ok(mut v) = b.lock() {
+                if ch > 1 {
+                    for f in data.chunks(ch) { v.push(f[0]); }
+                } else {
+                    v.extend_from_slice(data);
+                }
             }
-        }
-    }, |e| eprintln!("in error: {}", e), None)?;
-    stream.play()?;
-    std::thread::sleep(Duration::from_secs_f64(args.duration));
-    drop(stream);
+        }, |e| eprintln!("in error: {}", e), None)?;
+        stream.play()?;
+        std::thread::sleep(Duration::from_secs_f64(args.duration));
+        drop(stream);
+        let out = buf.lock().unwrap().clone();
+        out
+    };
 
-    let captured = buf.lock().unwrap().clone();
     let max_amp = captured.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
     let rms = (captured.iter().map(|s| s * s).sum::<f32>() / captured.len().max(1) as f32).sqrt();
     eprintln!("captured: {:.1}s max={:.4} RMS={:.6}", captured.len() as f64 / config.sample_rate as f64, max_amp, rms);

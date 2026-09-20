@@ -89,8 +89,13 @@ impl OfdmModulator {
     pub fn modulate_with_preamble(&mut self, data: &[u8]) -> Vec<f32> {
         let config = &self.config;
         let n_sc = config.active_subcarriers();
-        let bits_per_sym = n_sc * 2;
-        let total_frame_bits = config.data_symbols_per_frame * bits_per_sym;
+        let bits_per_sym = config.bits_per_ofdm_symbol();
+        let total_frame_bits = if config.differential {
+            // First data symbol is a known reference for time-differential.
+            config.data_symbols_per_frame.saturating_sub(1) * bits_per_sym
+        } else {
+            config.data_symbols_per_frame * bits_per_sym
+        };
 
         let data_bits = data.len() * 8;
         let pad_bits = total_frame_bits.saturating_sub(data_bits);
@@ -124,10 +129,29 @@ impl OfdmModulator {
 
         audio.extend_from_slice(&self.preamble_audio);
 
-        for chunk in bit_vec.chunks(bits_per_sym) {
-            let fd = qpsk::qpsk_map(chunk);
-            let td = self.inner.build_ofdm_symbol(&fd);
-            audio.extend_from_slice(&td);
+        if config.differential {
+            // Time-differential: the first data symbol is a known all-ones
+            // reference; each following symbol is the previous one rotated per
+            // subcarrier by its QPSK data. Data lives in the phase difference
+            // between consecutive symbols on the same subcarrier, so an
+            // arbitrary static channel cancels.
+            let ref_fd = vec![Complex32::new(1.0, 0.0); n_sc];
+            audio.extend_from_slice(&self.inner.build_ofdm_symbol(&ref_fd));
+            let mut acc = ref_fd;
+            for chunk in bit_vec.chunks(bits_per_sym) {
+                let d = qpsk::qpsk_map(chunk);
+                for i in 0..n_sc {
+                    acc[i] *= d[i];
+                }
+                let td = self.inner.build_ofdm_symbol(&acc);
+                audio.extend_from_slice(&td);
+            }
+        } else {
+            for chunk in bit_vec.chunks(bits_per_sym) {
+                let fd = qpsk::qpsk_map(chunk);
+                let td = self.inner.build_ofdm_symbol(&fd);
+                audio.extend_from_slice(&td);
+            }
         }
 
         let ramp_len = config.cp_length;

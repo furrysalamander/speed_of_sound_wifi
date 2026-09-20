@@ -226,6 +226,8 @@ impl OfdmDemodulator {
             .map(|i| self.channel_est[i].norm())
             .collect();
 
+        let mut prev_fd: Option<Vec<Complex32>> = None;
+
         for data_idx in 0..n_data {
             let sym_idx = cfg.preamble_symbols + data_idx;
             let sym_start = preamble_start + sym_idx * total_sym_samples;
@@ -234,6 +236,32 @@ impl OfdmDemodulator {
             }
 
             let mut fd = self.extract_ofdm_symbol(samples, sym_start);
+
+            if cfg.differential {
+                // Time-differential: compare each subcarrier with the same
+                // subcarrier in the previous OFDM symbol. An arbitrary static
+                // channel (and any common phase offset) cancels; the first
+                // data symbol is the known reference.
+                if data_idx == 0 {
+                    prev_fd = Some((0..n_sc).map(|i| fd[sc_min + i]).collect());
+                    continue;
+                }
+                let prev = prev_fd.as_ref().unwrap();
+                let mut diff = Vec::with_capacity(n_sc);
+                for i in 0..n_sc {
+                    diff.push(fd[sc_min + i] * prev[i].conj());
+                }
+                let bits = qpsk::qpsk_demap(&diff);
+                all_bits.extend_from_slice(&bits);
+                if std::env::var("SOSW_DEMOD_DEBUG").is_ok() && data_idx < 3 {
+                    let s: Vec<String> = diff.iter().take(8)
+                        .map(|c| format!("{:.2}{:+.2}j", c.re, c.im)).collect();
+                    eprintln!("[demod] diff sym{} (pre={} sym_start={}): {}", data_idx, preamble_start, sym_start, s.join(" "));
+                }
+                prev_fd = Some((0..n_sc).map(|i| fd[sc_min + i]).collect());
+                continue;
+            }
+
             let fd_slice = fd.as_slice_mut().unwrap_or(&mut []);
 
             let common = self.dd_common;
@@ -257,6 +285,20 @@ impl OfdmDemodulator {
 
             let bits = qpsk::qpsk_demap(&equalized);
             all_bits.extend_from_slice(&bits);
+
+            if std::env::var("SOSW_DEMOD_DEBUG").is_ok() && data_idx < 2 {
+                let s: Vec<String> = equalized.iter().take(8)
+                    .map(|c| format!("{:.2}{:+.2}j", c.re, c.im)).collect();
+                eprintln!("[demod] sym{} eq: {}", data_idx, s.join(" "));
+                eprintln!("[demod] sym{} common={:.3} slope={:.4} cfo={:.4} peak={:.3}",
+                    data_idx, self.dd_common, self.dd_slope, self.cfo_freq, norm_peak);
+                let hp: Vec<String> = (sc_min..sc_min + 8)
+                    .map(|i| format!("{:.1}", self.channel_est[i].arg())).collect();
+                let hm: Vec<String> = (sc_min..sc_min + 8)
+                    .map(|i| format!("{:.3}", self.channel_est[i].norm())).collect();
+                eprintln!("[demod] H phase[0:8]: {}", hp.join(" "));
+                eprintln!("[demod] H mag[0:8]:   {}", hm.join(" "));
+            }
 
             let re_encoded = qpsk::qpsk_hard_decision(&equalized);
             let mut phase_errors = Vec::with_capacity(n_sc);

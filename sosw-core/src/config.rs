@@ -19,6 +19,12 @@ pub struct Config {
     pub slope_clip: f32,
     pub scrambler_seed: u64,
     pub preamble_seed: u64,
+    /// Time-differential OFDM: data rides in the phase difference between
+    /// consecutive OFDM symbols on the same subcarrier, so a static channel
+    /// response and any common phase offset cancel and no absolute channel
+    /// estimate is needed.
+    #[serde(default)]
+    pub differential: bool,
 }
 
 impl Config {
@@ -43,6 +49,7 @@ impl Config {
             slope_clip: 0.02,
             scrambler_seed: 12345,
             preamble_seed: 42,
+            differential: false,
         }
     }
 
@@ -97,6 +104,7 @@ impl Config {
             slope_clip: 0.02,
             scrambler_seed: 12345,
             preamble_seed: 42,
+            differential: false,
         }
     }
 
@@ -122,6 +130,7 @@ impl Config {
             slope_clip: 0.02,
             scrambler_seed: 12345,
             preamble_seed: 42,
+            differential: false,
         }
     }
 
@@ -147,6 +156,7 @@ impl Config {
             slope_clip: 0.02,
             scrambler_seed: 12345,
             preamble_seed: 42,
+            differential: false,
         }
     }
 
@@ -172,6 +182,7 @@ impl Config {
             slope_clip: 0.02,
             scrambler_seed: 12345,
             preamble_seed: 42,
+            differential: false,
         }
     }
 
@@ -199,5 +210,32 @@ impl Config {
             "ultrawide" => Self::ultrawide(),
             _ => Self::ofdm_default(),
         }
+    }
+
+    /// Rebuild the OFDM layout and auto-fit `data_symbols_per_frame` to the
+    /// full FrameAssembler output (sync + RS-FEC + CRC) for this payload size.
+    pub fn with_layout(
+        mut self,
+        fft_size: usize,
+        cp_length: usize,
+        sc_min: usize,
+        sc_max: usize,
+        rs_nsym: usize,
+        payload_size: usize,
+    ) -> Self {
+        self.fft_size = fft_size;
+        self.cp_length = cp_length;
+        self.sc_min = sc_min;
+        self.sc_max = sc_max;
+        self.rs_nsym = rs_nsym;
+        self.payload_size = payload_size;
+        let max_data = 255usize.saturating_sub(rs_nsym).max(1);
+        let n_blocks = (4 + payload_size).div_ceil(max_data);
+        let frame_bytes = 8 + n_blocks * 255 + 4;
+        let bits_per_sym = self.bits_per_ofdm_symbol().max(1);
+        // Time-differential spends the first data symbol as a known reference.
+        let extra = if self.differential { 1 } else { 0 };
+        self.data_symbols_per_frame = (frame_bytes * 8).div_ceil(bits_per_sym) + extra;
+        self
     }
 }
