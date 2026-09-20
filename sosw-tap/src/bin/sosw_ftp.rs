@@ -62,6 +62,9 @@ struct Args {
     /// Receiver idle rounds before giving up.
     #[arg(long, default_value_t = 4)]
     max_rounds: usize,
+    /// Dump all received audio to this raw f32 file (for offline diagnosis).
+    #[arg(long)]
+    dump_rx: Option<String>,
 }
 
 fn make_cfg(a: &Args) -> FskConfig {
@@ -80,9 +83,21 @@ fn make_cfg(a: &Args) -> FskConfig {
     }
 }
 
+fn make_ack_cfg(a: &Args) -> FskConfig {
+    FskConfig {
+        // ACKs are short: a small preamble and CRC-only keep their air time
+        // (and therefore the half-duplex turnaround) small.
+        preamble_symbols: 12,
+        rs_nsym: 0,
+        payload_size: 16,
+        ..make_cfg(a)
+    }
+}
+
 fn main() -> Result<()> {
     let a = Args::parse();
     let cfg = make_cfg(&a);
+    let ack_cfg = make_ack_cfg(&a);
     match a.mode.as_str() {
         "sim" => {
             let data: Vec<u8> = (0..a.bytes).map(|i| (i as u8).wrapping_mul(37).wrapping_add(5)).collect();
@@ -94,7 +109,7 @@ fn main() -> Result<()> {
                 a.snr_db,
                 a.drop
             );
-            let stats = run_sender(&data, &mut ch, 10, a.max_retries.max(1));
+            let stats = run_sender(&data, &mut ch, 10, a.max_retries.max(1), &cfg, &cfg);
             let ok = ch.received == data;
             println!(
                 "result: received {} bytes, {} chunks, {} retransmits, {} timeouts, {} channel drops, matches={}",
@@ -112,7 +127,7 @@ fn main() -> Result<()> {
         "send" => {
             let path = a.file.as_deref().ok_or_else(|| anyhow::anyhow!("--file required"))?;
             let data = std::fs::read(path)?;
-            let mut t = AudioTransport::new(a.tx_device.as_deref(), a.rx_device.as_deref(), cfg.clone())?;
+            let mut t = AudioTransport::with_dump(a.tx_device.as_deref(), a.rx_device.as_deref(), cfg.clone(), a.dump_rx.as_deref())?;
             println!(
                 "sending {} bytes ({} chunks, {} bps raw) ...",
                 data.len(),
@@ -120,7 +135,7 @@ fn main() -> Result<()> {
                 cfg.raw_bps()
             );
             let start = Instant::now();
-            let stats = run_sender(&data, &mut t, a.timeout_ms, a.max_retries);
+            let stats = run_sender(&data, &mut t, a.timeout_ms, a.max_retries, &cfg, &ack_cfg);
             let dur = start.elapsed().as_secs_f32();
             println!(
                 "done: {} chunks, {} retransmits, {} timeouts in {:.1}s ({:.1} B/s)",
@@ -133,9 +148,9 @@ fn main() -> Result<()> {
         }
         "recv" => {
             let path = a.out.as_deref().unwrap_or("received.bin");
-            let mut t = AudioTransport::new(a.tx_device.as_deref(), a.rx_device.as_deref(), cfg.clone())?;
+            let mut t = AudioTransport::with_dump(a.tx_device.as_deref(), a.rx_device.as_deref(), cfg.clone(), a.dump_rx.as_deref())?;
             println!("listening for transfer (timeout {} ms) ...", a.timeout_ms);
-            let (data, stats) = run_receiver(&mut t, a.timeout_ms, a.max_rounds);
+            let (data, stats) = run_receiver(&mut t, a.timeout_ms, a.max_rounds, &cfg, &ack_cfg);
             std::fs::write(path, &data)?;
             println!(
                 "received {} bytes ({} chunks) -> {}",

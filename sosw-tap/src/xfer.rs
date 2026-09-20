@@ -5,7 +5,7 @@
 
 use sosw_core::physical::fsk::{self, FskConfig, FskDemodulator};
 
-pub const CHUNK: usize = 32;
+pub const CHUNK: usize = 64;
 const KIND_DATA: u8 = 0;
 const KIND_ACK: u8 = 1;
 const KIND_BYE: u8 = 2;
@@ -25,6 +25,16 @@ pub trait Transport {
     fn recv(&mut self, timeout_ms: u64) -> Option<Vec<u8>>;
     /// Switch the modem configuration (used by link training mode negotiation).
     fn set_config(&mut self, _cfg: FskConfig) {}
+    /// Send using a specific config (DATA and ACK can differ).
+    fn send_cfg(&mut self, payload: &[u8], cfg: &FskConfig) {
+        self.set_config(cfg.clone());
+        self.send(payload);
+    }
+    /// Receive using a specific config.
+    fn recv_cfg(&mut self, timeout_ms: u64, cfg: &FskConfig) -> Option<Vec<u8>> {
+        self.set_config(cfg.clone());
+        self.recv(timeout_ms)
+    }
     /// Quality of the most recently received frame: (min tone SNR dB, fec_ok).
     fn last_quality(&self) -> (f32, bool) {
         (0.0, true)
@@ -69,6 +79,8 @@ pub fn run_sender<T: Transport>(
     t: &mut T,
     timeout_ms: u64,
     max_retries: usize,
+    data_cfg: &FskConfig,
+    ack_cfg: &FskConfig,
 ) -> XferStats {
     let total = chunk_count(data.len());
     let mut stats = XferStats { bytes: data.len(), ..Default::default() };
@@ -81,7 +93,7 @@ pub fn run_sender<T: Transport>(
             if attempt > 0 {
                 stats.retransmits += 1;
             }
-            t.send(&frame);
+            t.send_cfg(&frame, data_cfg);
             // Listen for the matching ACK until the attempt deadline. Frames
             // that are not our ACK (e.g. our own delayed echo) are ignored
             // rather than treated as a response, so we do not retransmit early.
@@ -92,7 +104,7 @@ pub fn run_sender<T: Transport>(
                     stats.timeouts += 1;
                     break;
                 }
-                match t.recv(remaining.as_millis() as u64) {
+                match t.recv_cfg(remaining.as_millis() as u64, ack_cfg) {
                     Some(resp) => {
                         if let Some((kind, rseq, _, data)) = decode_transport(&resp) {
                             if kind == KIND_ACK && rseq == seq {
@@ -128,8 +140,10 @@ pub fn run_sender<T: Transport>(
     // multi-second timeouts chasing this ACK.
     let bye = encode_transport(KIND_BYE, total, total, &[]);
     for _ in 0..2 {
-        t.send(&bye);
-        if t.recv((timeout_ms / 2).max(2000)).is_some() {
+        // BYE is a DATA-class frame, so the receiver (listening with data_cfg)
+        // can decode it; its ACK comes back on ack_cfg.
+        t.send_cfg(&bye, data_cfg);
+        if t.recv_cfg((timeout_ms / 2).max(2000), ack_cfg).is_some() {
             break;
         }
     }
@@ -142,13 +156,15 @@ pub fn run_receiver<T: Transport>(
     t: &mut T,
     timeout_ms: u64,
     max_rounds: usize,
+    data_cfg: &FskConfig,
+    ack_cfg: &FskConfig,
 ) -> (Vec<u8>, XferStats) {
     let mut out = Vec::new();
     let mut expected: u16 = 0;
     let mut stats = XferStats::default();
     let mut idle = 0usize;
     loop {
-        let frame = match t.recv(timeout_ms) {
+        let frame = match t.recv_cfg(timeout_ms, data_cfg) {
             Some(f) => f,
             None => {
                 idle += 1;
@@ -183,11 +199,11 @@ pub fn run_receiver<T: Transport>(
                     0,
                     &[snr.clamp(0.0, 255.0) as u8, fec_ok as u8],
                 );
-                t.send(&ack);
+                t.send_cfg(&ack, ack_cfg);
             }
             KIND_BYE => {
                 let ack = encode_transport(KIND_ACK, seq, 0, &[]);
-                t.send(&ack);
+                t.send_cfg(&ack, ack_cfg);
                 break;
             }
             _ => {}
@@ -333,24 +349,45 @@ pub struct AudioTransport {
     /// Decoded frames not yet returned. Our own echo is decoded here too and
     /// ignored by the caller, instead of being discarded with the buffer.
     pending: std::collections::VecDeque<Vec<u8>>,
+    /// Optional raw capture of everything the local mic hears, for offline
+    /// diagnosis (little-endian f32).
+    dump: Option<std::fs::File>,
+    /// Capture accumulated across recv calls. A frame can be longer than the
+    /// recv timeout, so this must survive a timeout rather than being dropped.
+    collected: Vec<f32>,
 }
 
 impl AudioTransport {
     pub fn new(tx: Option<&str>, rx: Option<&str>, cfg: FskConfig) -> anyhow::Result<Self> {
+        Self::with_dump(tx, rx, cfg, None)
+    }
+
+    pub fn with_dump(
+        tx: Option<&str>,
+        rx: Option<&str>,
+        cfg: FskConfig,
+        dump_path: Option<&str>,
+    ) -> anyhow::Result<Self> {
+        let dump = match dump_path {
+            Some(p) => Some(std::fs::File::create(p)?),
+            None => None,
+        };
         Ok(Self {
             audio: crate::audio::DuplexAudio::new(tx, rx)?,
             cfg,
             last_quality: (0.0, true),
             pending: std::collections::VecDeque::new(),
+            dump,
+            collected: Vec::new(),
         })
     }
 }
 
 /// Turn gap before a receiver replies, so the sender's echo has ended.
-const RECV_TURN_GAP_MS: u64 = 600;
+const RECV_TURN_GAP_MS: u64 = 400;
 /// After an ACK, the sender waits out the peer's ACK air time plus echo tail
 /// before sending the next DATA, so the peer is listening when it arrives.
-const SEND_TURNAROUND_MS: u64 = 1600;
+const SEND_TURNAROUND_MS: u64 = 600;
 
 fn now_ms() -> String {
     let now = std::time::SystemTime::now()
@@ -371,6 +408,7 @@ impl Transport for AudioTransport {
         // before replying, so its response arrives after we unmute.
         self.audio.clear_rx();
         self.pending.clear();
+        self.collected.clear();
         let audio = self.cfg.encode_payload(payload);
         eprintln!(
             "[{}] TX {} samples ({:.1} s)",
@@ -391,13 +429,22 @@ impl Transport for AudioTransport {
         }
         let start = std::time::Instant::now();
         let timeout = std::time::Duration::from_millis(timeout_ms);
-        let mut collected: Vec<f32> = Vec::new();
         loop {
             std::thread::sleep(std::time::Duration::from_millis(50));
-            collected.extend(self.audio.take_rx());
-            if collected.len() >= self.cfg.preamble_samples() {
+            let chunk = self.audio.take_rx();
+            if let Some(f) = &mut self.dump {
+                use std::io::Write;
+                let mut bytes = Vec::with_capacity(chunk.len() * 4);
+                for s in &chunk {
+                    bytes.extend_from_slice(&s.to_le_bytes());
+                }
+                let _ = f.write_all(&bytes);
+            }
+            self.collected.extend(chunk);
+            if self.collected.len() >= self.cfg.preamble_samples() {
                 let dem = FskDemodulator::new(self.cfg.clone());
-                for fr in dem.decode_capture(&collected) {
+                let frames = dem.decode_capture(&self.collected);
+                for fr in &frames {
                     if let Some(p) = fsk::unwrap_frame(&fr.bytes) {
                         eprintln!(
                             "[{}] RX frame (kind={}) minSNR={:.1}dB meanSNR={:.1}dB",
@@ -410,11 +457,17 @@ impl Transport for AudioTransport {
                         self.pending.push_back(p);
                     }
                 }
-                if let Some(p) = self.pending.pop_front() {
-                    return Some(p);
+                // Only drop the capture once a *valid* frame is in hand. A
+                // partial frame can still produce a (CRC-failing) region, and
+                // clearing then would throw away the rest of the real frame.
+                if !self.pending.is_empty() {
+                    self.collected.clear();
+                    return self.pending.pop_front();
                 }
             }
             if start.elapsed() > timeout {
+                // Keep self.collected so a frame spanning this timeout is not
+                // lost; the next recv continues from here.
                 return None;
             }
         }
@@ -439,7 +492,7 @@ mod tests {
             symbol_samples: 480,
             rs_nsym: 16,
             fec_data_block: 32,
-            payload_size: 64,
+            payload_size: CHUNK + 8,
             guard_samples: 1_200,
             ..FskConfig::default()
         }
@@ -449,8 +502,8 @@ mod tests {
     fn clean_transfer_roundtrip() {
         let cfg = sim_cfg();
         let data: Vec<u8> = (0..200u8).map(|i| i.wrapping_mul(3)).collect();
-        let mut ch = SimTransport::new(cfg, None, 0.0, 1);
-        let stats = run_sender(&data, &mut ch, 10, 5);
+        let mut ch = SimTransport::new(cfg.clone(), None, 0.0, 1);
+        let stats = run_sender(&data, &mut ch, 10, 5, &cfg, &cfg);
         assert_eq!(ch.received, data, "clean transfer mismatch");
         assert_eq!(stats.retransmits, 0);
     }
@@ -459,8 +512,8 @@ mod tests {
     fn lossy_transfer_uses_arq() {
         let cfg = sim_cfg();
         let data: Vec<u8> = (0..400usize).map(|i| (i as u8).wrapping_add(11)).collect();
-        let mut ch = SimTransport::new(cfg, Some(20.0), 0.25, 7);
-        let stats = run_sender(&data, &mut ch, 10, 8);
+        let mut ch = SimTransport::new(cfg.clone(), Some(20.0), 0.25, 7);
+        let stats = run_sender(&data, &mut ch, 10, 24, &cfg, &cfg);
         assert_eq!(ch.received, data, "lossy transfer mismatch");
         assert!(stats.retransmits > 0, "ARQ never triggered");
     }
@@ -469,8 +522,8 @@ mod tests {
     fn receiver_only_collects_in_order() {
         let cfg = sim_cfg();
         let data: Vec<u8> = (0..100u8).collect();
-        let mut ch = SimTransport::new(cfg, None, 0.0, 2);
-        run_sender(&data, &mut ch, 10, 3);
+        let mut ch = SimTransport::new(cfg.clone(), None, 0.0, 2);
+        run_sender(&data, &mut ch, 10, 3, &cfg, &cfg);
         assert_eq!(ch.received.len(), data.len());
         assert_eq!(ch.received, data);
     }

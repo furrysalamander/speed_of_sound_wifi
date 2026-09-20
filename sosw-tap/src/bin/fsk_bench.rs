@@ -306,31 +306,24 @@ fn evaluate(a: &Args, cfg: &FskConfig, audio: &[f32], payloads: &[Vec<u8>]) -> M
             }
         }
         if a.diag {
-            let mut best = (usize::MAX, 0usize, usize::MAX);
-            for (pi, p) in payloads.iter().enumerate() {
-                let exp = cfg.bytes_to_symbols(&cfg.wire_bytes(p));
-                let errs = exp
-                    .iter()
-                    .zip(d.symbols.iter())
-                    .filter(|(a, b)| a != b)
-                    .count();
-                if errs < best.0 {
-                    best = (errs, pi, exp.len());
-                }
-            }
-            let first_bad = payloads.get(best.1).and_then(|p| {
-                let exp = cfg.bytes_to_symbols(&cfg.wire_bytes(p));
-                exp.iter()
-                    .zip(d.symbols.iter())
-                    .position(|(a, b)| a != b)
-            });
-            let extra = d.symbols.len().saturating_sub(best.2);
+            let unwrapped = fsk::unwrap_frame(&d.bytes);
+            let shown: String = unwrapped
+                .as_ref()
+                .map(|p| {
+                    p.iter()
+                        .take(10)
+                        .map(|b| format!("{:02x}", b))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .unwrap_or_else(|| "-".into());
             eprintln!(
-                "  [diag] frame {}: nsym={} exp={} extra={} payload={} real_sym_errs={} first_err={:?} grid_off={} pre_match={} minSNR={:.1} meanSNR={:.1} minConf={:.2} fec_ok={} unwrap={}",
-                fi, d.symbols.len(), best.2, extra, best.1, best.0, first_bad,
-                d.grid_offset, d.preamble_matches,
+                "  [diag] frame {}: nsym={} grid_off={} pre_match={} minSNR={:.1} meanSNR={:.1} minConf={:.2} fec_ok={} unwrap={} kind={:?} bytes=[{}]",
+                fi, d.symbols.len(), d.grid_offset, d.preamble_matches,
                 d.min_snr_db, d.mean_snr_db, d.mean_confidence, d.fec_ok,
-                fsk::unwrap_frame(&d.bytes).is_some(),
+                unwrapped.is_some(),
+                unwrapped.as_ref().map(|p| p.first().copied().unwrap_or(255)),
+                shown,
             );
         }
     }
