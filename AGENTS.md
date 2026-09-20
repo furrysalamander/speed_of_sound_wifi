@@ -39,6 +39,8 @@ cargo run -p sosw-tap -- serve --tap sosw0 --preset default
 | OFDM Mod | `src/physical/ofdm_mod.rs` | IFFT, CP, raised-cosine, normalization |
 | OFDM Demod | `src/physical/ofdm_demod.rs` | Timing, channel est, DD phase tracking |
 | DTMF | `src/physical/dtmf.rs` | DTMF tone-pair encode + grid-locked decode (control channel) |
+| FSK | `src/physical/fsk.rs` | Non-coherent CPFSK M-FSK: grid lock, per-tone calibration, compact RS FEC, wire framing. **The working acoustic PHY.** |
+| FSK bank | `src/physical/fsk_bank.rs` | Parallel multi-tone narrowband 2-FSK across the band (Stage 4 rate scaling) |
 | Scrambler | `src/link/scrambler.rs` | ChaCha12 XOR (seed=12345) |
 | CRC | `src/link/crc.rs` | CRC-32 (Ethernet/ZIP polynomial) |
 | RS FEC | `src/link/fec.rs` | RS(255,223) encode/decode via `reed-solomon` crate |
@@ -54,7 +56,18 @@ cargo run -p sosw-tap -- serve --tap sosw0 --preset default
 | PHY | `src/phy.rs` | Audio I/O + OFDM modem bridge |
 | MAC | `src/mac.rs` | CSMA/CA state machine |
 | Link | `src/link.rs` | DTMF link-training handshake framing (SYNC/kind/node/param/CRC) |
+| Audio | `src/audio.rs` | Reusable full-duplex cpal endpoint + capture file/WAV I/O |
+| Transport | `src/xfer.rs` | Stop-and-wait ARQ over FSK, shared `Transport` trait, lossy sim |
 | Fragment | `src/fragment.rs` | Ethernet fragmentation/reassembly |
+
+### Acoustic tools (`sosw-tap/src/bin`)
+
+| Tool | Purpose |
+|------|---------|
+| `phy_bench` | Stage 0 characterization: gain-step, gain-level, impulse, two-tone, tone-snr, latency |
+| `fsk_bench` | Stage 1/2/4: software/self/tx/rx/sweep, single-stream + parallel bank, FEC, PER/headroom/goodput |
+| `link_train` | Stage 3: discovery, control-channel headroom, rate negotiation (`--mode a|b|sim`) |
+| `sosw_ftp` | Stage 5: stop-and-wait ARQ file transfer (`--mode send|recv|sim`) |
 
 ## WASM Web App (`sosw-web`)
 
@@ -72,6 +85,8 @@ cargo run -p sosw-tap -- serve --tap sosw0 --preset default
 
 ```
 sosw-core lib (dtmf) ............. 7 passed
+sosw-core lib (fsk) ............. 14 passed  FSK M-FSK, FEC, calibration, framing
+sosw-core lib (fsk_bank) ......... 3 passed  parallel multi-tone bank
 tests/crc_tests.rs ............... 9 passed
 tests/scrambler_tests.rs ......... 9 passed
 tests/fec_tests.rs ............... 5 passed
@@ -83,23 +98,31 @@ tests/param_sweep.rs ............ 4 passed  (software sweep: FFT 128-512, CP 16-
 tests/debug_fft.rs .............. 1 passed
 tests/debug_preamble.rs ......... 1 passed
 sosw-tap lib (link/mac/fragment) 16 passed
-Total: 89 tests  (1 mock_tap_loopback test ignored)
+sosw-tap lib (xfer) .............. 3 passed  ARQ over a simulated lossy channel
+Total: 106 tests  (1 mock_tap_loopback test ignored)
 ```
 
 The `dtmf` and `link` tests cover grid-locked DTMF decoding (short symbols,
 capture offset, noise rejection) and link-frame recovery with dropped,
-inserted, and substituted symbols at every position.
+inserted, and substituted symbols at every position. The `fsk` tests cover
+clean/differential roundtrips for M=2/4/8/16, offset+noise, multipath with
+per-tone calibration, compact RS FEC, and chunked streaming. The `xfer` tests
+cover stop-and-wait ARQ over clean and 25%-drop channels.
 
-**OTA / acoustic status (2026-09-19):** software and digital (monitor) loopbacks
-pass 100%. Acoustic OFDM — and time-differential OFDM and single-carrier QPSK —
-do **not** decode over the air in the current setup, on either machine, at any
-tested level, preset, or CP. The DTMF control-channel handshake does work
-cross-machine. See `README.md` → "Link Status" for the measured evidence. Older
-"100% RS-correctable" acoustic tables below are **historical and not
-reproducible now**.
+**Acoustic link status (2026-09-20):** a non-coherent **M-FSK** PHY now works
+over the air. `sosw_ftp` transferred a 31-byte file **cross-machine
+giratina→deoxys byte-exact** (FSK + RS FEC + CRC + stop-and-wait ARQ). Self-
+loopback decodes at single-stream M=2/3ms (~130 bps effective) and a 16-channel
+parallel bank (~210 bps effective). Acoustic latency is ~3.8 s and the channel's
+coherent span is ~350 Hz; the channel is time-varying, so margins fluctuate and
+FEC/ARQ are required. See `README.md` → "Acoustic Link Proven" and
+`docs/channel-report.md`.
 
-The staged plan from here to a proven link (Ethernet deferred) is in
-`docs/link-development-plan.md`.
+Coherent wideband **OFDM** (and time-differential OFDM / SC-QPSK) still do
+**not** decode acoustically in this setup; older "100% RS-correctable" OFDM
+tables are **historical and not reproducible now**. The DTMF control channel
+works cross-machine. The staged plan and its per-stage status are in
+`docs/link-development-plan.md` (Stages 0–5 now implemented).
 
 ## Config Presets
 

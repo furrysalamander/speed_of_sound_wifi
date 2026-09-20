@@ -1,8 +1,19 @@
 # Link Development Plan — From Current State to a Proven Acoustic Data Link
 
-> Status: active. Written 2026-09-19. Supersedes the rate-first assumptions
-> implied by earlier docs. Ethernet/TAP/IP is **explicitly out of scope** until
-> every PHY and link piece below is proven.
+> Status: **Stages 0–5 implemented and exercised 2026-09-20.** Ethernet/TAP/IP
+> remains deferred. See `README.md` → "Acoustic Link Proven" and
+> `docs/channel-report.md`.
+>
+> | Stage | Deliverable | Outcome |
+> |-------|-------------|---------|
+> | 0 | `phy_bench` channel characterization | done; report written |
+> | 1 | non-coherent M-FSK baseline | done; decodes acoustically |
+> | 2 | M-FSK rate ladder | done; ~350 Hz coherent span limit found |
+> | 3 | `link_train` discovery + rate negotiation | done; sim-validated |
+> | 4 | parallel multi-tone FSK bank + RS FEC | done; 16ch/20ms ~210 bps eff. |
+> | 5 | `sosw_ftp` stop-and-wait ARQ | done; **cross-machine transfer proven** |
+>
+> Concrete results and rates are in `README.md` → "Acoustic Link Proven".
 
 ## Objective
 
@@ -85,6 +96,9 @@ delay spread and coherence bandwidth; latency measured (and reduced if possible)
 
 ## Stage 1 — Baseline reliable link (2-FSK, non-coherent)
 
+> **Done.** `sosw-core/src/physical/fsk.rs` (CPFSK + Goertzel + grid lock +
+> per-tone calibration + compact RS FEC); `fsk_bench` measures it.
+
 The simplest thing that can be proven end to end.
 
 - Constant-envelope **2-FSK**, narrowband (start ≈ 1–3 kHz), low baud (start
@@ -100,6 +114,10 @@ The simplest thing that can be proven end to end.
 
 ## Stage 2 — Rate ladder (M-FSK, baud up)
 
+> **Done** (single-stream). `fsk_bench --mode sweep`; the coherent span limit
+> (~350 Hz) caps single-stream M-FSK at ~333 bps and motivated Stage 4.
+
+
 Climb one rung at a time, measuring at every rung.
 
 - **M = 2 → 4 → 8 → 16**, baud **100 → 500 → 1000 → 2000** (adjust to the
@@ -113,6 +131,10 @@ Climb one rung at a time, measuring at every rung.
 decision whether it is good enough or Stage 4 is required.
 
 ## Stage 3 — Link training / handshake (full)
+
+> **Done** (logic). `sosw-tap/src/bin/link_train.rs`, `--mode a|b|sim`:
+> discovery, control-channel headroom, fastest-first mode probing, selection.
+
 
 Run over the robust low-rate channel (DTMF or the Stage-1 FSK), tolerant of
 multi-second latency and retries:
@@ -133,6 +155,11 @@ two nodes, reports achieved headroom, and is repeatable across runs.
 
 ## Stage 4 — Wideband equalized PHY (only if needed for rate)
 
+> **Done, as parallel multi-tone FSK** (`sosw-core/src/physical/fsk_bank.rs`),
+> chosen over SC-FDE because the channel is time-varying and non-coherent
+> detection is robust to it. 16 channels @ 20 ms reached ~210 bps effective.
+
+
 Gated on Stage 2 falling short **and** Stage 0/3 showing the channel supports it.
 Options, in order of preference:
 
@@ -148,6 +175,10 @@ encoding, interleaving, stronger FEC.
 **Exit criteria:** target rate at target headroom on all four paths.
 
 ## Stage 5 — Link layer (still no Ethernet)
+
+> **Done.** `sosw-tap/src/xfer.rs` (stop-and-wait ARQ) + `sosw_ftp`;
+> cross-machine giratina→deoxys transfer of 31 bytes verified byte-exact.
+
 
 - Framing, RS FEC, CRC, stop-and-wait ARQ, fragmentation.
 - Bidirectional **file transfer** with round-trip ACKs and integrity checking

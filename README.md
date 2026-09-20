@@ -161,6 +161,65 @@ then and now).
 The staged path from this state to a proven acoustic link (Ethernet deferred) is
 in [docs/link-development-plan.md](docs/link-development-plan.md).
 
+## Acoustic Link Proven (2026-09-20) — Rust FSK
+
+Following the plan in `docs/link-development-plan.md`, the existing coherent
+OFDM PHY was set aside and a **non-coherent M-FSK** PHY was built from first
+principles, characterized, and proven end to end. Details in
+[docs/channel-report.md](docs/channel-report.md).
+
+### What is proven
+
+- **Cross-machine acoustic file transfer, giratina → deoxys**: a 31-byte payload
+  (`HELLO-ACOUSTIC-LINK-1234567890!`) was transferred with **exact content
+  match**, using FSK + Reed-Solomon FEC + CRC-32 + stop-and-wait ARQ
+  (`sosw_ftp`). The link's own ARQ handled a fresh `HELLO_ACOUSTIC` DATA frame and
+  a BYE; the receiver log shows both decoded with 1.3 / 3.5 dB worst-case
+  headroom. *(Reverse direction not yet run with FSK; the DTMF control channel is
+  proven both ways.)*
+- **Self-loopback decode** on giratina across many configs, with per-frame CRC
+  validation.
+- **The protocol logic is deterministically tested** in software
+  (`sosw_ftp --mode sim`; `xfer` unit tests): clean transfers and 20–25% frame
+  drops at 18–20 dB SNR, with real ARQ retransmissions and byte-exact
+  reassembly.
+
+### Key measured facts that shaped the design (Stage 0)
+
+- Acoustic latency is **~3.8 s** (marker alignment), so timeouts are multi-second
+  and protocol turn-taking is expensive.
+- The capture path is linear to drive ≈0.8 and clips at 1.0; **no** drift within
+  a sustained tone, but **run- and history-dependent gain** — the likely reason
+  wideband coherent OFDM fails. Constant-envelope, bounded bursts are the
+  defense.
+- Single-tone SNR is ≥30 dB from 300 Hz–20 kHz, so this is not a noise problem.
+- The channel is only coherent over a **~350 Hz span**; a single wideband M-FSK
+  stream therefore caps at ~333 bps.
+
+### Achieved rates (self-loopback, FEC on)
+
+| PHY | raw | result | effective goodput |
+|-----|-----|--------|-------------------|
+| single M=2 / 3 ms | 333 bps | 0% frame error | ~130 bps |
+| bank 16ch / 20 ms | 800 bps | 0% frame error | ~210 bps |
+| cross-machine ftp | 50 bps | 31 B exact | ~0.1 B/s (ARQ + 3.8 s latency) |
+
+Higher rates are achievable in short bursts but are intermittent because the
+channel is time-varying.
+
+### New tooling (`sosw-tap`)
+
+- `phy_bench` — Stage 0 channel characterization (gain step, transfer curve,
+  impulse response, two-tone IM, tone SNR, latency) with dump/load captures.
+- `fsk_bench` — Stage 1/2/4 benchmark: software/self/tx/rx/sweep, single-stream
+  and parallel multi-tone bank, FEC, PER/headroom/goodput.
+- `link_train` — Stage 3 discovery + headroom measurement + rate negotiation
+  (`--mode a|b|sim`).
+- `sosw_ftp` — Stage 5 stop-and-wait ARQ file transfer (`--mode send|recv|sim`).
+
+The PHY lives in `sosw-core/src/physical/fsk.rs` and `fsk_bank.rs`; framing/FEC
+in the same modules. The old OFDM path remains but is not the acoustic link.
+
 ## Config Presets
 
 Software and digital (monitor) loopbacks pass at 100%. Acoustic over-the-air
