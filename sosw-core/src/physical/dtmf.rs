@@ -37,9 +37,9 @@ impl Default for DtmfConfig {
     fn default() -> Self {
         Self {
             sample_rate: 48000,
-            // 100 ms tone / 100 ms gap = 4 bits per 200 ms (~20 bps). The gap
-            // is at least one symbol so adjacent identical symbols stay
-            // separable even when the channel adds noise in the gaps.
+            // 100 ms tone / 100 ms gap = 4 bits per 200 ms (~20 bps). Both
+            // desktop and laptop mics decode this reliably; longer symbols
+            // were tried but only made every message take seconds longer.
             symbol_samples: 4800,
             gap_samples: 4800,
             amplitude: 0.4,
@@ -102,8 +102,10 @@ pub fn goertzel(samples: &[f32], freq: f32, sample_rate: f32) -> f32 {
     s1 * s1 + s2 * s2 - coeff * s1 * s2
 }
 
-/// Best-guess symbol from a single window of samples, plus a confidence ratio
-/// (strongest tone-pair energy / next-best row or column).
+/// Best-guess symbol from a single window of samples, plus a confidence in
+/// `0..1`: the smaller of how strongly the winning low and high tones
+/// dominate their frequency groups. A clean DTMF pair scores ~0.9+; broadband
+/// noise (energy spread across all four rows/columns) scores ~0.3.
 pub fn detect_symbol(window: &[f32], cfg: &DtmfConfig) -> Option<(u8, f32)> {
     let sr = cfg.sample_rate as f32;
     let low: Vec<f32> = LOW_FREQS.iter().map(|&f| goertzel(window, f, sr)).collect();
@@ -118,74 +120,91 @@ pub fn detect_symbol(window: &[f32], cfg: &DtmfConfig) -> Option<(u8, f32)> {
         .enumerate()
         .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))?;
 
-    // Second-best in each group, for a confidence estimate.
-    let l2 = low
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| *i != li)
-        .map(|(_, &v)| v)
-        .fold(0.0f32, f32::max);
-    let h2 = high
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| *i != hi)
-        .map(|(_, &v)| v)
-        .fold(0.0f32, f32::max);
-
-    let ratio = (lmax / (l2 + 1e-12)).min(hmax / (h2 + 1e-12));
-    let sym = (li * 4 + hi) as u8;
-    Some((sym, ratio))
+    let lsum: f32 = low.iter().sum::<f32>() + 1e-12;
+    let hsum: f32 = high.iter().sum::<f32>() + 1e-12;
+    let conf = (lmax / lsum).min(hmax / hsum);
+    Some(((li * 4 + hi) as u8, conf))
 }
 
-/// Decode a DTMF symbol stream by scanning overlapping windows, then keeping
-/// only the strongest detection in each neighborhood (non-max suppression).
-/// This tolerates arbitrary alignment and noisy gaps, and keeps adjacent
-/// identical symbols separate as long as the gap is a reasonable fraction of
-/// a symbol.
+/// Decode a DTMF symbol stream.
+///
+/// The transmitter uses a fixed symbol period, so the decoder locks to a
+/// symbol grid within each active region and samples one symbol per period.
+/// This is what makes it robust: over the air, a naive burst detector inserts
+/// and deletes symbols (tones split, gaps fill with noise), which breaks any
+/// frame. Sampling on the grid yields exactly one symbol per transmitted slot.
 pub fn decode(audio: &[f32], cfg: &DtmfConfig) -> Vec<u8> {
-    let win = (cfg.symbol_samples * 6 / 10).max(1);
-    if audio.len() < win {
+    let env_win = (cfg.sample_rate as usize / 100).max(1); // 10 ms
+    if audio.len() < env_win * 2 {
         return Vec::new();
     }
-    let hop = (cfg.sample_rate as usize / 200).max(1); // 5 ms
-    let energy = |s: &[f32]| s.iter().map(|v| v * v).sum::<f32>();
-    // Energy floor: a tone burst must be well above the quietest window, or
-    // numerical noise in silence yields bogus high tone ratios.
-    let max_energy = audio
-        .windows(win)
-        .step_by(hop)
-        .map(energy)
-        .fold(0.0f32, f32::max)
-        .max(1e-12);
-    let floor = max_energy * 0.05;
+    let env: Vec<f32> = audio
+        .windows(env_win)
+        .step_by(env_win)
+        .map(|w| w.iter().map(|v| v * v).sum::<f32>())
+        .collect();
 
-    let mut dets: Vec<(f32, u8, usize)> = Vec::new();
+    // Noise-floor-relative threshold. Using a fraction of the loudest window
+    // would let one loud transient (e.g. our own echo) mask quieter symbols.
+    let max_e = env.iter().cloned().fold(0.0f32, f32::max).max(1e-12);
+    let mut sorted = env.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let p20 = sorted[sorted.len() / 5].max(max_e * 0.001);
+    let thr = p20 * 2.0;
+
+    let period = cfg.symbol_samples + cfg.gap_samples;
+    let half = cfg.symbol_samples / 2;
+
+    // Split the recording into active regions, allowing short dips within a
+    // region so a brief amplitude ripple does not fragment a message.
+    let mut out = Vec::new();
+    let gap_tol = (cfg.gap_samples / 2).max(1);
     let mut i = 0;
-    while i + win <= audio.len() {
-        if energy(&audio[i..i + win]) >= floor {
-            if let Some((sym, ratio)) = detect_symbol(&audio[i..i + win], cfg) {
-                if ratio > 3.0 {
-                    dets.push((ratio, sym, i));
-                }
+    while i < env.len() {
+        while i < env.len() && env[i] <= thr {
+            i += 1;
+        }
+        if i >= env.len() {
+            break;
+        }
+        let region_start = i * env_win;
+        // Extend the region while there is energy, tolerating short dips.
+        let mut last_active = i;
+        let mut j = i;
+        while j < env.len() {
+            if env[j] > thr {
+                last_active = j;
+            } else if (j - last_active) * env_win > gap_tol {
+                break;
             }
+            j += 1;
         }
-        i += hop;
-    }
+        let region_end = ((last_active + 1) * env_win).min(audio.len());
+        i = last_active + 1;
 
-    // Greedy non-max suppression over ratio, then merge detections that are
-    // closer than one symbol period. Symbols are separated by a full gap, so
-    // picking the strongest detection per ~1.3-symbol cluster is safe and
-    // collapses edge detections into one symbol.
-    dets.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    let min_sep = (cfg.symbol_samples * 13 / 10).max(1);
-    let mut chosen: Vec<(usize, u8)> = Vec::new();
-    for (_, sym, pos) in dets {
-        if chosen.iter().all(|(p, _)| p.abs_diff(pos) >= min_sep) {
-            chosen.push((pos, sym));
+        // Grid-decode this region: one sample per symbol period. Only accept
+        // the region if at least one slot looks like a genuine DTMF pair, so
+        // pure noise regions produce nothing.
+        let mut slots: Vec<(u8, f32)> = Vec::new();
+        let mut k = 0;
+        loop {
+            let center = region_start + half + k * period;
+            if center + half > region_end || center < half {
+                break;
+            }
+            let a = center - half;
+            let b = center + half;
+            if let Some((sym, conf)) = detect_symbol(&audio[a..b], cfg) {
+                slots.push((sym, conf));
+            }
+            k += 1;
+        }
+        let best = slots.iter().map(|(_, c)| *c).fold(0.0f32, f32::max);
+        if best >= 0.85 {
+            out.extend(slots.into_iter().map(|(s, _)| s));
         }
     }
-    chosen.sort_by_key(|(p, _)| *p);
-    chosen.into_iter().map(|(_, s)| s).collect()
+    out
 }
 
 /// Pack nibbles (each < 16) into bytes, two per byte (high nibble first).
@@ -252,5 +271,22 @@ mod tests {
         let all: Vec<u8> = (0..16).collect();
         let audio = encode(&all, &cfg);
         assert_eq!(decode(&audio, &cfg), all);
+    }
+
+    #[test]
+    fn test_noise_alone_decodes_nothing() {
+        let cfg = DtmfConfig::default();
+        // Low-frequency-ish random walk + white noise, similar to room rumble.
+        let mut rng = 12345u32;
+        let mut v = 0.0f32;
+        let mut audio = Vec::with_capacity(48000 * 2);
+        for _ in 0..48000 * 2 {
+            rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
+            let w = ((rng >> 8) as f32 / 16_777_216.0) * 2.0 - 1.0;
+            v = v * 0.999 + w * 0.001;
+            audio.push(v + w * 0.001);
+        }
+        let syms = decode(&audio, &cfg);
+        assert!(syms.is_empty(), "noise produced symbols: {:X?}", syms);
     }
 }
