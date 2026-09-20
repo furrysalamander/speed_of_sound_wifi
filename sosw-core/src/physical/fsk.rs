@@ -21,6 +21,79 @@ use crate::link::crc;
 use crate::physical::dtmf::goertzel;
 use std::f32::consts::PI;
 
+/// Compact byte-level Reed-Solomon FEC for FSK frames. Each block is
+/// `data_block` data bytes plus `nsym` parity bytes; shortened codes are used
+/// so small frames do not pay for a full 255-byte RS block.
+pub struct FskFec {
+    pub data_block: usize,
+    pub nsym: usize,
+    encoder: reed_solomon::Encoder,
+    decoder: reed_solomon::Decoder,
+}
+
+impl FskFec {
+    pub fn new(data_block: usize, nsym: usize) -> Self {
+        Self {
+            data_block: data_block.max(1),
+            nsym,
+            encoder: reed_solomon::Encoder::new(nsym),
+            decoder: reed_solomon::Decoder::new(nsym),
+        }
+    }
+
+    pub fn block_len(&self) -> usize {
+        self.data_block + self.nsym
+    }
+
+    pub fn n_blocks(&self, wire_len: usize) -> usize {
+        wire_len.div_ceil(self.data_block).max(1)
+    }
+
+    pub fn coded_len(&self, wire_len: usize) -> usize {
+        self.n_blocks(wire_len) * self.block_len()
+    }
+
+    pub fn encode(&self, wire: &[u8]) -> Vec<u8> {
+        let nb = self.n_blocks(wire.len());
+        let mut out = Vec::with_capacity(nb * self.block_len());
+        for b in 0..nb {
+            let start = b * self.data_block;
+            let mut block = vec![0u8; self.data_block];
+            let end = (start + self.data_block).min(wire.len());
+            if start < wire.len() {
+                block[..end - start].copy_from_slice(&wire[start..end]);
+            }
+            let buf = self.encoder.encode(&block);
+            out.extend_from_slice(buf.data());
+            out.extend_from_slice(buf.ecc());
+        }
+        out
+    }
+
+    /// Decode exactly `n_blocks` blocks from `coded`; returns (data, all_ok).
+    pub fn decode(&self, coded: &[u8], n_blocks: usize) -> (Vec<u8>, bool) {
+        let bl = self.block_len();
+        let mut out = Vec::with_capacity(n_blocks * self.data_block);
+        let mut ok = true;
+        for b in 0..n_blocks {
+            let start = b * bl;
+            if start + bl > coded.len() {
+                ok = false;
+                break;
+            }
+            let mut block = coded[start..start + bl].to_vec();
+            match self.decoder.correct(&mut block, None) {
+                Ok(c) => out.extend_from_slice(c.data()),
+                Err(_) => {
+                    ok = false;
+                    out.extend_from_slice(&block[..self.data_block]);
+                }
+            }
+        }
+        (out, ok)
+    }
+}
+
 /// Wrap a payload for FSK transmission: `[len_hi, len_lo, payload..., crc32]`.
 /// The FSK preamble already provides frame sync, so this is all the framing the
 /// PHY needs; CRC-32 gives end-to-end integrity.
@@ -64,6 +137,8 @@ pub struct FskDecoded {
     pub mean_confidence: f32,
     /// Number of symbols over which the stats were computed (payload only).
     pub n_symbols: usize,
+    /// Whether the RS FEC decoded without flagged block failures.
+    pub fec_ok: bool,
     /// Samples of `process_samples` input consumed by this frame.
     pub consumed_samples: usize,
 }
@@ -95,9 +170,11 @@ pub struct FskConfig {
     pub leading_silence: usize,
     /// Silence inserted after the frame body (defines the burst boundary).
     pub guard_samples: usize,
-    /// Reed-Solomon parity symbols used by the outer frame (0 disables FEC).
+    /// Reed-Solomon parity bytes per block (0 disables FEC).
     pub rs_nsym: usize,
-    /// Maximum payload size advertised to the outer frame parser.
+    /// Data bytes per RS block when FEC is enabled.
+    pub fec_data_block: usize,
+    /// Fixed payload size (wire framing is sized from this).
     pub payload_size: usize,
 }
 
@@ -115,7 +192,8 @@ impl Default for FskConfig {
             differential: false,
             leading_silence: 2_400,
             guard_samples: 4_800,
-            rs_nsym: 16,
+            rs_nsym: 0,
+            fec_data_block: 32,
             payload_size: 128,
         }
     }
@@ -257,6 +335,37 @@ impl FskConfig {
         out.extend(self.encode_body(bytes));
         out.extend(std::iter::repeat(0.0).take(self.guard_samples));
         out
+    }
+
+    pub fn fec(&self) -> Option<FskFec> {
+        if self.rs_nsym > 0 {
+            Some(FskFec::new(self.fec_data_block, self.rs_nsym))
+        } else {
+            None
+        }
+    }
+
+    /// Length of the wire frame (length+crc header plus payload).
+    pub fn wire_len(&self) -> usize {
+        self.payload_size + 6
+    }
+
+    /// Build the transmitted wire bytes for a payload: pad/truncate to the
+    /// fixed payload size, append length+crc, then RS-code if enabled.
+    pub fn wire_bytes(&self, payload: &[u8]) -> Vec<u8> {
+        let mut p = vec![0u8; self.payload_size];
+        let n = payload.len().min(self.payload_size);
+        p[..n].copy_from_slice(&payload[..n]);
+        let wire = wrap_frame(&p);
+        match self.fec() {
+            Some(fec) => fec.encode(&wire),
+            None => wire,
+        }
+    }
+
+    /// Encode a payload end to end (framing + optional FEC + modulation).
+    pub fn encode_payload(&self, payload: &[u8]) -> Vec<f32> {
+        self.encode_frame(&self.wire_bytes(payload))
     }
 
     fn render_symbols(&self, symbols: &[u8], phase0: f32) -> Vec<f32> {
@@ -594,7 +703,14 @@ impl FskDemodulator {
         let mean_snr = data_snr.iter().sum::<f32>() / n_sym as f32;
         let min_snr = data_snr.iter().copied().fold(f32::INFINITY, f32::min);
         let mean_conf = data_conf.iter().sum::<f32>() / n_sym as f32;
-        let bytes = self.cfg.symbols_to_bytes(&data_symbols);
+        let raw = self.cfg.symbols_to_bytes(&data_symbols);
+        let (bytes, fec_ok) = match self.cfg.fec() {
+            Some(fec) => {
+                let nb = fec.n_blocks(self.cfg.wire_len());
+                fec.decode(&raw, nb)
+            }
+            None => (raw, true),
+        };
         Some(FskDecoded {
             symbols: data_symbols,
             bytes,
@@ -602,6 +718,7 @@ impl FskDemodulator {
             min_snr_db: min_snr,
             mean_confidence: mean_conf,
             n_symbols: n_sym,
+            fec_ok,
             consumed_samples: region.len(),
         })
     }
@@ -721,6 +838,65 @@ mod tests {
         }
         let dem = FskDemodulator::new(c);
         assert!(dem.decode_capture(&audio).is_empty());
+    }
+
+    #[test]
+    fn fec_corrects_block_errors() {
+        let fec = FskFec::new(32, 16);
+        let data: Vec<u8> = (0..100u8).collect();
+        let mut coded = fec.encode(&data);
+        // Corrupt up to 8 bytes in each block (rs can fix nsym/2 per block).
+        let bl = fec.block_len();
+        let nb = fec.n_blocks(data.len());
+        for b in 0..nb {
+            for k in 0..8 {
+                let i = b * bl + k * 3;
+                if i < coded.len() {
+                    coded[i] ^= 0xA5;
+                }
+            }
+        }
+        let (out, ok) = fec.decode(&coded, nb);
+        assert!(ok, "FEC reported failure");
+        assert_eq!(&out[..data.len()], &data[..], "FEC data mismatch");
+    }
+
+    #[test]
+    fn payload_fec_roundtrip_through_symbols() {
+        let c = FskConfig {
+            m: 4,
+            symbol_samples: 960,
+            rs_nsym: 24,
+            fec_data_block: 32,
+            payload_size: 64,
+            ..FskConfig::default()
+        };
+        let payload: Vec<u8> = (0..64u8).collect();
+        let audio = c.encode_payload(&payload);
+        let dem = FskDemodulator::new(c.clone());
+        let frames = dem.decode_capture(&audio);
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0].fec_ok);
+        assert_eq!(unwrap_frame(&frames[0].bytes), Some(payload));
+    }
+
+    #[test]
+    fn payload_fec_roundtrip_m2() {
+        let c = FskConfig {
+            m: 2,
+            symbol_samples: 144,
+            rs_nsym: 16,
+            fec_data_block: 32,
+            payload_size: 32,
+            ..FskConfig::default()
+        };
+        let payload: Vec<u8> = (0..32u8).collect();
+        let audio = c.encode_payload(&payload);
+        let dem = FskDemodulator::new(c.clone());
+        let frames = dem.decode_capture(&audio);
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0].fec_ok);
+        assert_eq!(unwrap_frame(&frames[0].bytes), Some(payload));
     }
 
     #[test]

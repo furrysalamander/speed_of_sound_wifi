@@ -13,6 +13,7 @@
 use anyhow::Result;
 use clap::Parser;
 use sosw_core::physical::fsk::{self, FskConfig, FskDecoded, FskDemodulator};
+use sosw_core::physical::fsk_bank::{FskBankConfig, FskBankDemodulator};
 use sosw_tap::audio::{self, DuplexAudio};
 use std::time::Duration;
 
@@ -40,9 +41,21 @@ struct Args {
     payload: usize,
     #[arg(long, default_value_t = 24)]
     preamble: usize,
+    /// Reed-Solomon parity bytes per block (0 disables FEC).
+    #[arg(long, default_value_t = 0)]
+    rs_nsym: usize,
+    /// Data bytes per FEC block.
+    #[arg(long, default_value_t = 32)]
+    fec_block: usize,
     /// Guard silence after each frame, in ms.
     #[arg(long, default_value_t = 120)]
     guard_ms: u64,
+    /// Parallel sub-channels (0 = single-stream FSK; >0 = multi-tone bank).
+    #[arg(long, default_value_t = 0)]
+    channels: usize,
+    /// Grid units between bank channels (guard = stride - tones).
+    #[arg(long, default_value_t = 3)]
+    channel_stride: usize,
     /// AWGN SNR in dB for software mode (omit for clean).
     #[arg(long)]
     snr_db: Option<f32>,
@@ -71,6 +84,9 @@ fn make_cfg(a: &Args) -> FskConfig {
         preamble_symbols: a.preamble,
         differential: a.differential,
         guard_samples: (a.guard_ms as usize * SR as usize) / 1000,
+        rs_nsym: a.rs_nsym,
+        fec_data_block: a.fec_block,
+        payload_size: a.payload,
         ..FskConfig::default()
     }
 }
@@ -85,10 +101,161 @@ fn payloads(a: &Args) -> Vec<Vec<u8>> {
         .collect()
 }
 
+fn make_bank_cfg(a: &Args) -> FskBankConfig {
+    FskBankConfig {
+        n_channels: a.channels,
+        tones_per_channel: a.m.max(2),
+        symbol_samples: (a.symbol_ms as usize * SR as usize) / 1000,
+        base_freq: a.base_freq,
+        tone_stride: 1,
+        channel_stride: a.channel_stride,
+        amplitude: a.amplitude,
+        preamble_symbols: a.preamble,
+        guard_samples: (a.guard_ms as usize * SR as usize) / 1000,
+        rs_nsym: a.rs_nsym,
+        fec_data_block: a.fec_block,
+        payload_size: a.payload,
+        ..FskBankConfig::default()
+    }
+}
+
+fn build_bank_script(cfg: &FskBankConfig, payloads: &[Vec<u8>]) -> Vec<f32> {
+    let mut out = Vec::new();
+    for p in payloads {
+        out.extend(cfg.encode_payload(p));
+    }
+    out
+}
+
+fn evaluate_bank(cfg: &FskBankConfig, audio: &[f32], payloads: &[Vec<u8>]) -> Metrics {
+    let dem = FskBankDemodulator::new(cfg.clone());
+    let decoded = dem.decode_capture(audio);
+    let mut m = Metrics {
+        sent: payloads.len(),
+        min_snr_db: f32::INFINITY,
+        min_conf: f32::INFINITY,
+        ..Default::default()
+    };
+    let mut snr_sum = 0.0;
+    for d in &decoded {
+        m.decoded += 1;
+        m.min_snr_db = m.min_snr_db.min(d.min_snr_db);
+        m.min_conf = m.min_conf.min(d.mean_confidence);
+        snr_sum += d.mean_snr_db;
+        if let Some(p) = fsk::unwrap_frame(&d.bytes) {
+            if payloads.iter().any(|x| x == &p) {
+                m.valid += 1;
+            }
+        }
+    }
+    m.mean_snr_db = if m.decoded > 0 {
+        snr_sum / m.decoded as f32
+    } else {
+        0.0
+    };
+    if !m.min_snr_db.is_finite() {
+        m.min_snr_db = 0.0;
+    }
+    if !m.min_conf.is_finite() {
+        m.min_conf = 0.0;
+    }
+    m
+}
+
+fn report_bank(a: &Args, cfg: &FskBankConfig, m: &Metrics) {
+    let bits_per_period = cfg.n_channels * cfg.bits_per_channel_symbol();
+    let wire_len = a.payload + 6;
+    let coded_len = if a.rs_nsym > 0 {
+        wire_len.div_ceil(a.fec_block.max(1)) * (a.fec_block + a.rs_nsym)
+    } else {
+        wire_len
+    };
+    let payload_periods = (coded_len * 8).div_ceil(bits_per_period.max(1));
+    let frame_samples = (cfg.preamble_symbols + payload_periods) * cfg.symbol_samples
+        + cfg.guard_samples;
+    let frame_s = frame_samples as f32 / SR as f32;
+    let goodput = if frame_s > 0.0 {
+        (a.payload * 8) as f32 / frame_s
+    } else {
+        0.0
+    };
+    let eff = goodput * (1.0 - m.per());
+    println!(
+        "BANK ch={} tones={} sym={}ms span={:.0}Hz hi={:.0}Hz raw={:.0}bps frames={} decoded={} valid={} PER={:.1}% minSNR={:.1}dB meanSNR={:.1}dB minConf={:.2} goodput={:.0}bps eff={:.0}bps",
+        cfg.n_channels,
+        cfg.tones_per_channel,
+        a.symbol_ms,
+        cfg.channel_span(),
+        cfg.highest_freq(),
+        cfg.raw_bps(),
+        m.sent,
+        m.decoded,
+        m.valid,
+        m.per() * 100.0,
+        m.min_snr_db,
+        m.mean_snr_db,
+        m.min_conf,
+        goodput,
+        eff,
+    );
+}
+
+fn run_bank(a: &Args, ps: &[Vec<u8>]) -> Result<()> {
+    let cfg = make_bank_cfg(a);
+    let mut script = build_bank_script(&cfg, ps);
+    match a.mode.as_str() {
+        "software" => {
+            if let Some(snr) = a.snr_db {
+                add_noise(&mut script, snr);
+            }
+            let m = evaluate_bank(&cfg, &script, ps);
+            report_bank(a, &cfg, &m);
+        }
+        "tx" => {
+            let dev = DuplexAudio::new(a.tx_device.as_deref(), a.rx_device.as_deref())?;
+            eprintln!(
+                "playing {} bank frames ({:.1} s), hi {:.0} Hz",
+                ps.len(),
+                script.len() as f32 / SR as f32,
+                cfg.highest_freq()
+            );
+            dev.play_blocking(&script, Duration::from_millis(200));
+        }
+        "rx" | "self" => {
+            let rec = if let Some(path) = &a.load {
+                audio::load_capture(path)?
+            } else {
+                let dev = DuplexAudio::new(a.tx_device.as_deref(), a.rx_device.as_deref())?;
+                dev.clear_rx();
+                if a.mode == "self" {
+                    dev.play_now(&script);
+                }
+                let total = if a.mode == "self" {
+                    script.len() as f32 / SR as f32 * 1000.0 + a.latency_ms as f32 + 1000.0
+                } else {
+                    a.rx_ms as f32
+                };
+                eprintln!("recording {:.0} ms", total);
+                std::thread::sleep(Duration::from_millis(total as u64));
+                let rec = dev.take_rx();
+                if let Some(path) = &a.dump {
+                    audio::save_f32(path, &rec)?;
+                    eprintln!("saved {} samples to {}", rec.len(), path);
+                }
+                rec
+            };
+            let m = evaluate_bank(&cfg, &rec, ps);
+            report_bank(a, &cfg, &m);
+        }
+        other => anyhow::bail!("unknown mode '{}'", other),
+    }
+    Ok(())
+}
+
 fn build_script(cfg: &FskConfig, payloads: &[Vec<u8>]) -> Vec<f32> {
     let mut out = Vec::new();
     for p in payloads {
-        out.extend(cfg.encode_frame(&fsk::wrap_frame(p)));
+        out.extend(cfg.encode_payload(p));
     }
     out
 }
@@ -163,7 +330,13 @@ fn add_noise(audio: &mut [f32], snr_db: f32) {
 
 fn report(a: &Args, cfg: &FskConfig, m: &Metrics, _rec_len: usize) {
     // Per-frame goodput: payload bits / (air time of one frame incl. guard).
-    let payload_syms = (a.payload + 6) * 8 / cfg.bits_per_symbol().max(1) + 1;
+    let wire_len = a.payload + 6;
+    let coded_len = if a.rs_nsym > 0 {
+        wire_len.div_ceil(a.fec_block.max(1)) * (a.fec_block + a.rs_nsym)
+    } else {
+        wire_len
+    };
+    let payload_syms = coded_len * 8 / cfg.bits_per_symbol().max(1) + 1;
     let frame_samples =
         (cfg.preamble_symbols + payload_syms) * cfg.symbol_samples + cfg.guard_samples;
     let frame_s = frame_samples as f32 / SR as f32;
@@ -199,6 +372,9 @@ fn main() -> Result<()> {
     }
 
     let ps = payloads(&a);
+    if a.channels > 0 {
+        return run_bank(&a, &ps);
+    }
     let script = build_script(&cfg, &ps);
     let mut audio = script.clone();
 
@@ -294,6 +470,10 @@ fn sweep(_a: &Args) -> Result<()> {
                 payload,
                 preamble: 24,
                 guard_ms: 125,
+                channels: 0,
+                channel_stride: 3,
+                rs_nsym: 0,
+                fec_block: 32,
                 snr_db: Some(snr),
                 tx_device: None,
                 rx_device: None,
