@@ -198,6 +198,37 @@ principles, characterized, and proven end to end. Details in
 - The channel is only coherent over a **~350 Hz span**; a single wideband M-FSK
   stream therefore caps at ~333 bps.
 
+### Why the rate is limited: the room is frequency-selective
+
+Sounding the band (24 carriers, 1.0–10.2 kHz, 2-FSK pairs) shows **deep, narrow
+(~200 Hz) notches**: carriers decode or are dead depending on where they fall
+(deox→gir is solid at 1.0/1.5/2.0/3.5 kHz and dead at 2.5/3.0/4.5/5.0/6.0/8.0
+kHz, repeatable). A ~200 Hz null spacing implies a ~5 ms reflection.
+
+- The **500 ms tone sweep is not predictive**: it samples one tone every 2 kHz
+  and reports 47–49 dB at 6 kHz, stepping over the nulls that kill a 200 Hz FSK
+  pair. "The sweep looked great" is a trap.
+- **Coherent OFDM fails** at every CP (64–2048) and every level inside the
+  measured linear region (62% byte errors, preamble peak 0.30 vs 0.998 on the
+  digital monitor): whole subcarriers sit in nulls and there is no frequency
+  interleaving.
+- **Non-coherent FSK works** because it only needs one clean 200–350 Hz window.
+  Replaying recorded clips showed **zero symbol errors** on every fully-captured
+  frame; the apparent PER was recording-window truncation.
+
+### Carrier-selective bank (higher-rate path)
+
+`sosw-core/src/physical/fsk_bank.rs` now supports an explicit carrier list, and
+`sosw-tap/src/bin/fsk_bench.rs --carriers ...` sounds/uses it. Per-channel
+preamble SNR and match fraction are reported (`--diag`). Six carriers are solid
+in **both** directions (1.0/3.0/4.6/8.2/8.6/9.0 kHz); the 6-carrier bank
+decodes with **100% conditional success** at payload 16 and ~75% at payload 32
+(long frames lose per-channel calibration, so short chunks are used).
+
+Status: the bank PHY and sounding are proven; `xfer::BankTransport` and
+`sosw_ftp --carriers` are wired but the bank ARQ receiver is not yet decoding
+reliably (remaining bug). Realistic target ~3× the single-stream rate.
+
 ### Achieved rates (self-loopback, FEC on)
 
 | PHY | raw | result | effective goodput |
