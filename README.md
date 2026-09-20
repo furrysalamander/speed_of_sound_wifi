@@ -175,8 +175,10 @@ principles, characterized, and proven end to end. Details in
   match**, using FSK + Reed-Solomon FEC + CRC-32 + stop-and-wait ARQ
   (`sosw_ftp`). The link's own ARQ handled a fresh `HELLO_ACOUSTIC` DATA frame and
   a BYE; the receiver log shows both decoded with 1.3 / 3.5 dB worst-case
-  headroom. *(Reverse direction not yet run with FSK; the DTMF control channel is
-  proven both ways.)*
+  headroom.
+- **Both directions cross-machine**: a one-way M=2/20 ms FSK probe decodes
+  giratina→deoxys (3/5 frames) and deoxys→giratina (3/5 frames, 8.2 dB
+  worst-case headroom). The 40% frame loss is why FEC + ARQ are mandatory.
 - **Self-loopback decode** on giratina across many configs, with per-frame CRC
   validation.
 - **The protocol logic is deterministically tested** in software
