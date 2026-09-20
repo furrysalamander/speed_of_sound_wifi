@@ -94,8 +94,14 @@ pub fn run_sender<T: Transport>(
                 }
                 match t.recv(remaining.as_millis() as u64) {
                     Some(resp) => {
-                        if let Some((kind, rseq, _, _)) = decode_transport(&resp) {
+                        if let Some((kind, rseq, _, data)) = decode_transport(&resp) {
                             if kind == KIND_ACK && rseq == seq {
+                                let (my_snr, _) = t.last_quality();
+                                let peer_snr = data.first().copied().unwrap_or(0) as f32;
+                                eprintln!(
+                                    "  [arq] seq {} acked: peer_rx_snr={:.0} dB, my_rx_snr={:.1} dB",
+                                    seq, peer_snr, my_snr
+                                );
                                 acked = true;
                                 break;
                             }
@@ -113,13 +119,17 @@ pub fn run_sender<T: Transport>(
         }
         if acked {
             stats.chunks += 1;
+            // Wait out the peer's ACK air time and echo tail before the next
+            // DATA, so the peer is listening when it arrives.
+            std::thread::sleep(std::time::Duration::from_millis(SEND_TURNAROUND_MS));
         }
     }
-    // Best-effort BYE.
+    // Best-effort BYE: the receiver also exits on idle, so do not spend many
+    // multi-second timeouts chasing this ACK.
     let bye = encode_transport(KIND_BYE, total, total, &[]);
-    for _ in 0..max_retries {
+    for _ in 0..2 {
         t.send(&bye);
-        if t.recv(timeout_ms).is_some() {
+        if t.recv((timeout_ms / 2).max(2000)).is_some() {
             break;
         }
     }
@@ -161,8 +171,18 @@ pub fn run_receiver<T: Transport>(
                     stats.bytes += data.len();
                     expected = expected.wrapping_add(1);
                 }
-                // ACK current expected-1 (dup) or the seq just accepted.
-                let ack = encode_transport(KIND_ACK, seq, 0, &[]);
+                // Turn gap: let the sender's own speaker echo decay and its
+                // mute release before we transmit, so it hears only our ACK.
+                std::thread::sleep(std::time::Duration::from_millis(RECV_TURN_GAP_MS));
+                // ACK current seq and report the measured DATA quality so the
+                // sender can log/adapt on evidence.
+                let (snr, fec_ok) = t.last_quality();
+                let ack = encode_transport(
+                    KIND_ACK,
+                    seq,
+                    0,
+                    &[snr.clamp(0.0, 255.0) as u8, fec_ok as u8],
+                );
                 t.send(&ack);
             }
             KIND_BYE => {
@@ -310,6 +330,9 @@ pub struct AudioTransport {
     audio: crate::audio::DuplexAudio,
     cfg: FskConfig,
     last_quality: (f32, bool),
+    /// Decoded frames not yet returned. Our own echo is decoded here too and
+    /// ignored by the caller, instead of being discarded with the buffer.
+    pending: std::collections::VecDeque<Vec<u8>>,
 }
 
 impl AudioTransport {
@@ -318,42 +341,77 @@ impl AudioTransport {
             audio: crate::audio::DuplexAudio::new(tx, rx)?,
             cfg,
             last_quality: (0.0, true),
+            pending: std::collections::VecDeque::new(),
         })
     }
 }
 
+/// Turn gap before a receiver replies, so the sender's echo has ended.
+const RECV_TURN_GAP_MS: u64 = 600;
+/// After an ACK, the sender waits out the peer's ACK air time plus echo tail
+/// before sending the next DATA, so the peer is listening when it arrives.
+const SEND_TURNAROUND_MS: u64 = 1600;
+
+fn now_ms() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let s = now.as_secs();
+    format!("{:02}:{:02}:{:02}.{:03}", (s / 3600) % 24, (s / 60) % 60, s % 60, now.subsec_millis())
+}
+
+/// Mute tail after playback, to ride out the local speaker echo (as in the
+/// proven `sosw_link` handshake).
+const ECHO_TAIL_MS: u64 = 250;
+
 impl Transport for AudioTransport {
     fn send(&mut self, payload: &[u8]) {
+        // Transmit with the local mic muted (plus an echo tail) so we never
+        // record our own, much louder, speaker echo. The peer waits a turn gap
+        // before replying, so its response arrives after we unmute.
+        self.audio.clear_rx();
+        self.pending.clear();
         let audio = self.cfg.encode_payload(payload);
         eprintln!(
-            "  TX {} samples ({:.1} s)",
+            "[{}] TX {} samples ({:.1} s)",
+            now_ms(),
             audio.len(),
             audio.len() as f32 / 48_000.0
         );
-        self.audio.play_blocking(&audio, std::time::Duration::from_millis(50));
-        // Drop our own delayed echo so it does not crowd the listen window.
-        self.audio.clear_rx();
+        self.audio.play_muted(&audio, std::time::Duration::from_millis(ECHO_TAIL_MS));
     }
 
     fn recv(&mut self, timeout_ms: u64) -> Option<Vec<u8>> {
-        let mut dem = FskDemodulator::new(self.cfg.clone());
-        self.audio.clear_rx();
+        // Return any already-decoded frame first (e.g. our own echo, which the
+        // caller ignores), then collect the listen window and decode the whole
+        // capture once. Decoding a growing buffer in a sliding window only ever
+        // sees prefixes and never assembles a frame (the `sosw_link` lesson).
+        if let Some(p) = self.pending.pop_front() {
+            return Some(p);
+        }
         let start = std::time::Instant::now();
         let timeout = std::time::Duration::from_millis(timeout_ms);
+        let mut collected: Vec<f32> = Vec::new();
         loop {
             std::thread::sleep(std::time::Duration::from_millis(50));
-            let chunk = self.audio.take_rx();
-            if !chunk.is_empty() {
-                if let Some(fr) = dem.process_samples(&chunk) {
+            collected.extend(self.audio.take_rx());
+            if collected.len() >= self.cfg.preamble_samples() {
+                let dem = FskDemodulator::new(self.cfg.clone());
+                for fr in dem.decode_capture(&collected) {
                     if let Some(p) = fsk::unwrap_frame(&fr.bytes) {
                         eprintln!(
-                            "  RX frame (kind={}) minSNR={:.1}dB",
+                            "[{}] RX frame (kind={}) minSNR={:.1}dB meanSNR={:.1}dB",
+                            now_ms(),
                             p.first().copied().unwrap_or(255),
-                            fr.min_snr_db
+                            fr.min_snr_db,
+                            fr.mean_snr_db
                         );
                         self.last_quality = (fr.min_snr_db, fr.fec_ok);
-                        return Some(p);
+                        self.pending.push_back(p);
                     }
+                }
+                if let Some(p) = self.pending.pop_front() {
+                    return Some(p);
                 }
             }
             if start.elapsed() > timeout {

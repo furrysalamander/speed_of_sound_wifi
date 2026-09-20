@@ -73,6 +73,9 @@ struct Args {
     dump: Option<String>,
     #[arg(long)]
     load: Option<String>,
+    /// Print per-frame symbol-level diagnostics.
+    #[arg(long, default_value_t = false)]
+    diag: bool,
 }
 
 fn make_cfg(a: &Args) -> FskConfig {
@@ -137,7 +140,7 @@ fn evaluate_bank(cfg: &FskBankConfig, audio: &[f32], payloads: &[Vec<u8>]) -> Me
         ..Default::default()
     };
     let mut snr_sum = 0.0;
-    for d in &decoded {
+    for (fi, d) in decoded.iter().enumerate() {
         m.decoded += 1;
         m.min_snr_db = m.min_snr_db.min(d.min_snr_db);
         m.min_conf = m.min_conf.min(d.mean_confidence);
@@ -147,6 +150,7 @@ fn evaluate_bank(cfg: &FskBankConfig, audio: &[f32], payloads: &[Vec<u8>]) -> Me
                 m.valid += 1;
             }
         }
+        let _ = fi;
     }
     m.mean_snr_db = if m.decoded > 0 {
         snr_sum / m.decoded as f32
@@ -291,7 +295,7 @@ fn evaluate(a: &Args, cfg: &FskConfig, audio: &[f32], payloads: &[Vec<u8>]) -> M
         ..Default::default()
     };
     let mut snr_sum = 0.0;
-    for d in &decoded {
+    for (fi, d) in decoded.iter().enumerate() {
         m.decoded += 1;
         m.min_snr_db = m.min_snr_db.min(d.min_snr_db);
         m.min_conf = m.min_conf.min(d.mean_confidence);
@@ -300,6 +304,34 @@ fn evaluate(a: &Args, cfg: &FskConfig, audio: &[f32], payloads: &[Vec<u8>]) -> M
             if payloads.iter().any(|x| x == &p) {
                 m.valid += 1;
             }
+        }
+        if a.diag {
+            let mut best = (usize::MAX, 0usize, usize::MAX);
+            for (pi, p) in payloads.iter().enumerate() {
+                let exp = cfg.bytes_to_symbols(&cfg.wire_bytes(p));
+                let errs = exp
+                    .iter()
+                    .zip(d.symbols.iter())
+                    .filter(|(a, b)| a != b)
+                    .count();
+                if errs < best.0 {
+                    best = (errs, pi, exp.len());
+                }
+            }
+            let first_bad = payloads.get(best.1).and_then(|p| {
+                let exp = cfg.bytes_to_symbols(&cfg.wire_bytes(p));
+                exp.iter()
+                    .zip(d.symbols.iter())
+                    .position(|(a, b)| a != b)
+            });
+            let extra = d.symbols.len().saturating_sub(best.2);
+            eprintln!(
+                "  [diag] frame {}: nsym={} exp={} extra={} payload={} real_sym_errs={} first_err={:?} grid_off={} pre_match={} minSNR={:.1} meanSNR={:.1} minConf={:.2} fec_ok={} unwrap={}",
+                fi, d.symbols.len(), best.2, extra, best.1, best.0, first_bad,
+                d.grid_offset, d.preamble_matches,
+                d.min_snr_db, d.mean_snr_db, d.mean_confidence, d.fec_ok,
+                fsk::unwrap_frame(&d.bytes).is_some(),
+            );
         }
     }
     m.mean_snr_db = if m.decoded > 0 {
@@ -481,6 +513,7 @@ fn sweep(_a: &Args) -> Result<()> {
                 latency_ms: 6000,
                 dump: None,
                 load: None,
+                diag: false,
             };
             let mt = evaluate(&sub, &cfg, &audio, &ps);
             println!(

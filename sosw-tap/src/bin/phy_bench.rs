@@ -47,6 +47,10 @@ struct AudioArgs {
     /// Extra recording time to cover the (multi-second) acoustic latency.
     #[arg(long, default_value_t = 6000)]
     record_extra_ms: u64,
+    /// Drain the capture for this long before playing, to flush any input
+    /// pipeline backlog (which otherwise inflates the apparent latency).
+    #[arg(long, default_value_t = 0)]
+    pre_drain_ms: u64,
 }
 
 #[derive(Subcommand)]
@@ -302,6 +306,15 @@ fn acquire(a: &AudioArgs, body: &[f32], segs: &[(usize, usize)]) -> Result<Acqui
     } else {
         let dev = DuplexAudio::new(a.tx_device.as_deref(), a.rx_device.as_deref())?;
         dev.clear_rx();
+        if a.pre_drain_ms > 0 {
+            // Continuously discard until the pipeline backlog has flushed.
+            let t = std::time::Instant::now();
+            while t.elapsed() < Duration::from_millis(a.pre_drain_ms) {
+                let _ = dev.take_rx();
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            dev.clear_rx();
+        }
         std::thread::sleep(Duration::from_millis(100));
         dev.play_now(&script);
         let dur = Duration::from_secs_f64(script.len() as f64 / SR as f64);

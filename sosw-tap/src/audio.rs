@@ -58,8 +58,13 @@ impl DuplexAudio {
         let host = cpal::default_host();
         let out_dev = pick_device(&host, tx_dev, true)?;
         let in_dev = pick_device(&host, rx_dev, false)?;
-        let out_cfg = out_dev.default_output_config()?.config();
-        let in_cfg = in_dev.default_input_config()?.config();
+        let mut out_cfg = out_dev.default_output_config()?.config();
+        let mut in_cfg = in_dev.default_input_config()?.config();
+        // Request small callback periods. With cpal's PulseAudio backend a
+        // Fixed buffer size sets the end-to-end latency target; the Default
+        // lets the server choose a very large buffer (multi-second here).
+        out_cfg.buffer_size = cpal::BufferSize::Fixed(256);
+        in_cfg.buffer_size = cpal::BufferSize::Fixed(256);
         let in_channels = in_cfg.channels as usize;
         let out_channels = out_cfg.channels as usize;
         let sample_rate = in_cfg.sample_rate;

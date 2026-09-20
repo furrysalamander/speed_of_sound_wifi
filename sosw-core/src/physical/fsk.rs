@@ -139,6 +139,10 @@ pub struct FskDecoded {
     pub n_symbols: usize,
     /// Whether the RS FEC decoded without flagged block failures.
     pub fec_ok: bool,
+    /// Symbol-grid offset (samples into the detected burst) chosen by the demod.
+    pub grid_offset: usize,
+    /// Preamble symbols matched at that offset.
+    pub preamble_matches: usize,
     /// Samples of `process_samples` input consumed by this frame.
     pub consumed_samples: usize,
 }
@@ -350,17 +354,40 @@ impl FskConfig {
         self.payload_size + 6
     }
 
-    /// Build the transmitted wire bytes for a payload: pad/truncate to the
-    /// fixed payload size, append length+crc, then RS-code if enabled.
+    /// Build the transmitted wire bytes for a payload: append length+crc, then
+    /// RS-code if enabled. No padding to a fixed size, so a short ACK stays
+    /// short instead of costing as much air time as a full DATA frame.
     pub fn wire_bytes(&self, payload: &[u8]) -> Vec<u8> {
-        let mut p = vec![0u8; self.payload_size];
-        let n = payload.len().min(self.payload_size);
-        p[..n].copy_from_slice(&payload[..n]);
-        let wire = wrap_frame(&p);
+        let p = if payload.len() > self.payload_size {
+            &payload[..self.payload_size]
+        } else {
+            payload
+        };
+        let wire = wrap_frame(p);
         match self.fec() {
             Some(fec) => fec.encode(&wire),
             None => wire,
         }
+    }
+
+    /// FEC-decode a variable-length wire frame. The length lives in the first
+    /// data block, so decode that, read it, then decode the remaining blocks.
+    pub fn decode_wire_fec(&self, raw: &[u8], fec: &FskFec) -> (Vec<u8>, bool) {
+        let bl = fec.block_len();
+        if raw.len() < bl {
+            return (raw.to_vec(), false);
+        }
+        let (first, ok1) = fec.decode(&raw[..bl], 1);
+        if first.len() < 2 {
+            return (first, false);
+        }
+        let len = ((first[0] as usize) << 8) | first[1] as usize;
+        let wire_len = 2 + len + 4;
+        let nb = fec.n_blocks(wire_len);
+        let need = (nb * bl).min(raw.len());
+        let (data, ok2) = fec.decode(&raw[..need], nb);
+        let wire = data[..wire_len.min(data.len())].to_vec();
+        (wire, ok1 && ok2)
     }
 
     /// Encode a payload end to end (framing + optional FEC + modulation).
@@ -584,10 +611,12 @@ impl FskDemodulator {
         // Grid search: the offset whose preamble slots best match the known
         // preamble. Scoring on both symbol identity and confidence rejects
         // noise that happens to trigger the energy detector.
-        let step = (n / 32).max(1);
-        let mut best: Option<(usize, f32, usize)> = None;
-        let mut off = 0usize;
-        loop {
+        //
+        // The coarse pass steps a fraction of a symbol; tone orthogonality
+        // needs single-sample alignment, so a fine pass then refines around the
+        // coarse winner. Without the fine pass a half-step error leaks energy
+        // between adjacent tones and corrupts marginal symbols.
+        let eval = |off: usize| -> Option<(f32, usize)> {
             let mut score = 0.0f32;
             let mut matches = 0usize;
             let mut cnt = 0usize;
@@ -603,8 +632,21 @@ impl FskDemodulator {
                     score += conf + 0.5 + (snr / 20.0).min(1.0);
                 }
             }
-            if cnt == pre.len() && matches * 4 >= pre.len() * 3 {
-                if best.map_or(true, |(_, bs, _)| score > bs) {
+            if cnt == pre.len() {
+                Some((score, matches))
+            } else {
+                None
+            }
+        };
+
+        let step = (n / 32).max(1);
+        let mut best: Option<(usize, f32, usize)> = None;
+        let mut off = 0usize;
+        loop {
+            if let Some((score, matches)) = eval(off) {
+                if matches * 4 >= pre.len() * 3
+                    && best.map_or(true, |(_, bs, _)| score > bs)
+                {
                     best = Some((off, score, matches));
                 }
             }
@@ -613,7 +655,20 @@ impl FskDemodulator {
             }
             off = (off + step).min(n);
         }
-        let off = best?.0;
+        let coarse = best?.0;
+        let lo = coarse.saturating_sub(step);
+        let hi = (coarse + step).min(n);
+        let mut fine: Option<(usize, f32, usize)> = None;
+        for o in lo..=hi {
+            if let Some((score, matches)) = eval(o) {
+                if matches * 4 >= pre.len() * 3
+                    && fine.map_or(true, |(_, bs, _)| score > bs)
+                {
+                    fine = Some((o, score, matches));
+                }
+            }
+        }
+        let off = fine.unwrap_or((coarse, 0.0, 0)).0;
 
         // Estimate a per-tone gain from the preamble. Every tone appears about
         // equally there, so accumulating the received energy at each known
@@ -705,10 +760,7 @@ impl FskDemodulator {
         let mean_conf = data_conf.iter().sum::<f32>() / n_sym as f32;
         let raw = self.cfg.symbols_to_bytes(&data_symbols);
         let (bytes, fec_ok) = match self.cfg.fec() {
-            Some(fec) => {
-                let nb = fec.n_blocks(self.cfg.wire_len());
-                fec.decode(&raw, nb)
-            }
+            Some(fec) => self.cfg.decode_wire_fec(&raw, &fec),
             None => (raw, true),
         };
         Some(FskDecoded {
@@ -719,6 +771,8 @@ impl FskDemodulator {
             mean_confidence: mean_conf,
             n_symbols: n_sym,
             fec_ok,
+            grid_offset: off,
+            preamble_matches: matches,
             consumed_samples: region.len(),
         })
     }

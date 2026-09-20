@@ -191,14 +191,35 @@ impl FskBankConfig {
     }
 
     pub fn wire_bytes(&self, payload: &[u8]) -> Vec<u8> {
-        let mut p = vec![0u8; self.payload_size];
-        let n = payload.len().min(self.payload_size);
-        p[..n].copy_from_slice(&payload[..n]);
-        let wire = wrap_frame(&p);
+        let p = if payload.len() > self.payload_size {
+            &payload[..self.payload_size]
+        } else {
+            payload
+        };
+        let wire = wrap_frame(p);
         match self.fec() {
             Some(fec) => fec.encode(&wire),
             None => wire,
         }
+    }
+
+    /// FEC-decode a variable-length wire frame (length lives in block 0).
+    pub fn decode_wire_fec(&self, raw: &[u8], fec: &FskFec) -> (Vec<u8>, bool) {
+        let bl = fec.block_len();
+        if raw.len() < bl {
+            return (raw.to_vec(), false);
+        }
+        let (first, ok1) = fec.decode(&raw[..bl], 1);
+        if first.len() < 2 {
+            return (first, false);
+        }
+        let len = ((first[0] as usize) << 8) | first[1] as usize;
+        let wire_len = 2 + len + 4;
+        let nb = fec.n_blocks(wire_len);
+        let need = (nb * bl).min(raw.len());
+        let (data, ok2) = fec.decode(&raw[..need], nb);
+        let wire = data[..wire_len.min(data.len())].to_vec();
+        (wire, ok1 && ok2)
     }
 
     pub fn encode_payload(&self, payload: &[u8]) -> Vec<f32> {
@@ -502,10 +523,7 @@ impl FskBankDemodulator {
         }
         let raw = self.cfg.matrix_to_bytes(&rows);
         let (bytes, fec_ok) = match self.cfg.fec() {
-            Some(fec) => {
-                let nb = fec.n_blocks(self.cfg.wire_len());
-                fec.decode(&raw, nb)
-            }
+            Some(fec) => self.cfg.decode_wire_fec(&raw, &fec),
             None => (raw, true),
         };
         let mean_snr = snrs.iter().sum::<f32>() / snrs.len().max(1) as f32;
