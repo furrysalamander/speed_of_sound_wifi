@@ -1,0 +1,205 @@
+//! Acoustic file transfer: stop-and-wait ARQ over FSK, with RS FEC + CRC.
+//!
+//!   sosw-ftp --mode sim  [--bytes N] [--snr-db D] [--drop P]
+//!   sosw-ftp --mode recv --out FILE [--rx-device ..] [--timeout-ms ..]
+//!   sosw-ftp --mode send --file FILE [--tx-device ..] [--rx-device ..]
+//!
+//! The `sim` mode runs both endpoints over an in-process lossy channel and is
+//! the deterministic test of the protocol. The acoustic modes are meant to run
+//! on two machines (recv first on the peer, then send here); the acoustic
+//! latency is multi-second, so the timeout is generous.
+
+use anyhow::Result;
+use clap::Parser;
+use sosw_core::physical::fsk::{self, FskConfig, FskDemodulator};
+use sosw_tap::audio::DuplexAudio;
+use sosw_tap::xfer::{self, run_receiver, run_sender, SimTransport, Transport};
+use std::time::{Duration, Instant};
+
+const SR: u32 = 48_000;
+
+#[derive(Parser)]
+#[command(name = "sosw-ftp", about = "Stop-and-wait acoustic file transfer")]
+struct Args {
+    #[arg(long, default_value = "sim")]
+    mode: String,
+    #[arg(long)]
+    file: Option<String>,
+    #[arg(long)]
+    out: Option<String>,
+    /// Bytes to transfer in sim mode.
+    #[arg(long, default_value_t = 512)]
+    bytes: usize,
+    #[arg(long)]
+    snr_db: Option<f32>,
+    #[arg(long, default_value_t = 0.0)]
+    drop: f32,
+    #[arg(long, default_value_t = 4)]
+    m: usize,
+    #[arg(long, default_value_t = 3)]
+    symbol_ms: u64,
+    #[arg(long, default_value_t = 1000.0)]
+    base_freq: f32,
+    #[arg(long, default_value_t = 0.5)]
+    amplitude: f32,
+    #[arg(long, default_value_t = 16)]
+    rs_nsym: usize,
+    #[arg(long, default_value_t = 64)]
+    fec_block: usize,
+    #[arg(long, default_value_t = 24)]
+    preamble: usize,
+    #[arg(long, default_value_t = 120)]
+    guard_ms: u64,
+    #[arg(long)]
+    tx_device: Option<String>,
+    #[arg(long)]
+    rx_device: Option<String>,
+    /// Per-exchange receive timeout.
+    #[arg(long, default_value_t = 14000)]
+    timeout_ms: u64,
+    #[arg(long, default_value_t = 6)]
+    max_retries: usize,
+    /// Receiver idle rounds before giving up.
+    #[arg(long, default_value_t = 4)]
+    max_rounds: usize,
+}
+
+fn make_cfg(a: &Args) -> FskConfig {
+    FskConfig {
+        m: a.m,
+        symbol_samples: (a.symbol_ms as usize * SR as usize) / 1000,
+        base_freq: a.base_freq,
+        amplitude: a.amplitude,
+        preamble_symbols: a.preamble,
+        guard_samples: (a.guard_ms as usize * SR as usize) / 1000,
+        rs_nsym: a.rs_nsym,
+        fec_data_block: a.fec_block,
+        // Transport frames are 6 + CHUNK bytes; round up with margin.
+        payload_size: xfer::CHUNK + 16,
+        ..FskConfig::default()
+    }
+}
+
+/// Acoustic endpoint: each `send` plays one frame; each `recv` listens for one.
+struct AcousticTransport {
+    audio: DuplexAudio,
+    cfg: FskConfig,
+}
+
+impl AcousticTransport {
+    fn new(a: &Args, cfg: FskConfig) -> Result<Self> {
+        Ok(Self {
+            audio: DuplexAudio::new(a.tx_device.as_deref(), a.rx_device.as_deref())?,
+            cfg,
+        })
+    }
+}
+
+impl Transport for AcousticTransport {
+    fn send(&mut self, payload: &[u8]) {
+        let audio = self.cfg.encode_payload(payload);
+        eprintln!(
+            "  TX {} samples ({:.1} s)",
+            audio.len(),
+            audio.len() as f32 / SR as f32
+        );
+        self.audio.play_blocking(&audio, Duration::from_millis(50));
+        // Drop our own delayed echo so it does not crowd the listen window.
+        self.audio.clear_rx();
+    }
+
+    fn recv(&mut self, timeout_ms: u64) -> Option<Vec<u8>> {
+        let mut dem = FskDemodulator::new(self.cfg.clone());
+        self.audio.clear_rx();
+        let start = Instant::now();
+        let timeout = Duration::from_millis(timeout_ms);
+        loop {
+            std::thread::sleep(Duration::from_millis(50));
+            let chunk = self.audio.take_rx();
+            if !chunk.is_empty() {
+                if let Some(fr) = dem.process_samples(&chunk) {
+                    if let Some(p) = fsk::unwrap_frame(&fr.bytes) {
+                        eprintln!(
+                            "  RX frame (kind at byte0={}) minSNR={:.1}dB",
+                            p.first().copied().unwrap_or(255),
+                            fr.min_snr_db
+                        );
+                        return Some(p);
+                    }
+                }
+            }
+            if start.elapsed() > timeout {
+                return None;
+            }
+        }
+    }
+}
+
+fn main() -> Result<()> {
+    let a = Args::parse();
+    let cfg = make_cfg(&a);
+    match a.mode.as_str() {
+        "sim" => {
+            let data: Vec<u8> = (0..a.bytes).map(|i| (i as u8).wrapping_mul(37).wrapping_add(5)).collect();
+            let mut ch = SimTransport::new(cfg.clone(), a.snr_db, a.drop, 0xC0FFEE);
+            println!(
+                "sim: {} bytes, {} chunks, snr={:?} dB, drop={:.2}",
+                data.len(),
+                xfer::chunk_count(data.len()),
+                a.snr_db,
+                a.drop
+            );
+            let stats = run_sender(&data, &mut ch, 10, a.max_retries.max(1));
+            let ok = ch.received == data;
+            println!(
+                "result: received {} bytes, {} chunks, {} retransmits, {} timeouts, {} channel drops, matches={}",
+                ch.received.len(),
+                stats.chunks,
+                stats.retransmits,
+                stats.timeouts,
+                ch.dropped,
+                ok
+            );
+            if !ok {
+                anyhow::bail!("sim transfer mismatch");
+            }
+        }
+        "send" => {
+            let path = a.file.as_deref().ok_or_else(|| anyhow::anyhow!("--file required"))?;
+            let data = std::fs::read(path)?;
+            let mut t = AcousticTransport::new(&a, cfg.clone())?;
+            println!(
+                "sending {} bytes ({} chunks, {} bps raw) ...",
+                data.len(),
+                xfer::chunk_count(data.len()),
+                cfg.raw_bps()
+            );
+            let start = Instant::now();
+            let stats = run_sender(&data, &mut t, a.timeout_ms, a.max_retries);
+            let dur = start.elapsed().as_secs_f32();
+            println!(
+                "done: {} chunks, {} retransmits, {} timeouts in {:.1}s ({:.1} B/s)",
+                stats.chunks,
+                stats.retransmits,
+                stats.timeouts,
+                dur,
+                data.len() as f32 / dur.max(0.01)
+            );
+        }
+        "recv" => {
+            let path = a.out.as_deref().unwrap_or("received.bin");
+            let mut t = AcousticTransport::new(&a, cfg.clone())?;
+            println!("listening for transfer (timeout {} ms) ...", a.timeout_ms);
+            let (data, stats) = run_receiver(&mut t, a.timeout_ms, a.max_rounds);
+            std::fs::write(path, &data)?;
+            println!(
+                "received {} bytes ({} chunks) -> {}",
+                data.len(),
+                stats.chunks,
+                path
+            );
+        }
+        other => anyhow::bail!("unknown mode '{}'", other),
+    }
+    Ok(())
+}
