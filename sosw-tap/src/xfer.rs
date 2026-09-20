@@ -89,11 +89,18 @@ pub fn run_sender<T: Transport>(
         let end = (start + CHUNK).min(data.len());
         let frame = encode_transport(KIND_DATA, seq, total, &data[start..end]);
         let mut acked = false;
+        let mut chunk_air_ms = 0.0f64;
+        let mut chunk_wait_ms = 0.0f64;
+        let mut attempts = 0usize;
         for attempt in 0..=max_retries {
             if attempt > 0 {
                 stats.retransmits += 1;
             }
+            attempts += 1;
+            let t_air = std::time::Instant::now();
             t.send_cfg(&frame, data_cfg);
+            chunk_air_ms += t_air.elapsed().as_secs_f64() * 1000.0;
+            let t_wait = std::time::Instant::now();
             // Listen for the matching ACK until the attempt deadline. Frames
             // that are not our ACK (e.g. our own delayed echo) are ignored
             // rather than treated as a response, so we do not retransmit early.
@@ -125,10 +132,15 @@ pub fn run_sender<T: Transport>(
                     }
                 }
             }
+            chunk_wait_ms += t_wait.elapsed().as_secs_f64() * 1000.0;
             if acked {
                 break;
             }
         }
+        eprintln!(
+            "[perf] chunk {}: air={:.0}ms wait={:.0}ms attempts={} bytes={}",
+            seq, chunk_air_ms, chunk_wait_ms, attempts, end - start
+        );
         if acked {
             stats.chunks += 1;
             // Wait out the peer's ACK air time and echo tail before the next

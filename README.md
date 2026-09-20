@@ -204,10 +204,36 @@ principles, characterized, and proven end to end. Details in
 |-----|-----|--------|-------------------|
 | single M=2 / 3 ms | 333 bps | 0% frame error | ~130 bps |
 | bank 16ch / 20 ms | 800 bps | 0% frame error | ~210 bps |
-| cross-machine ftp | 50 bps | 31 B exact | ~0.1 B/s (ARQ + 3.8 s latency) |
 
-Higher rates are achievable in short bursts but are intermittent because the
-channel is time-varying.
+### Cross-machine ARQ file transfer (M=2 / 5 ms, RS FEC, CRC, stop-and-wait)
+
+| direction | payload | result | throughput |
+|-----------|---------|--------|------------|
+| giratina → deoxys | 256 B | byte-exact, 0 retransmits | **9.0 B/s** |
+| deoxys → giratina | 128 B | byte-exact | **4.3 B/s** (weaker direction) |
+
+The jump from the initial ~0.3 B/s came from fixing real bugs found by
+replaying recorded clips, not from tuning blind:
+
+- **Latency was 3.9 s** because cpal used `BufferSize::Default` and PulseAudio
+  picked a multi-second buffer. `BufferSize::Fixed(256)` drops it to ~120 ms.
+- **The ARQ ACK timeout was 12 s**; at 120 ms latency the sender only needs
+  ~3 s, so every lost ACK cost 12 s instead of 3 s.
+- **Half-duplex echo**: the sender decoded its own loud DATA echo and the
+  receiver re-decoded its own ACK. Fixed with the proven `sosw_link` pattern
+  (mute + echo tail on TX, receiver turn gap, collect-then-decode, persistent
+  decoded-frame queue).
+- **A partial frame's region discarded the rest of the frame** on recv timeout;
+  the capture buffer now persists and is only cleared once a valid frame is in
+  hand.
+- **ACKs were as long as DATA frames** (padded FEC); they now use a short
+  preamble with a small RS FEC, cutting ACK air time roughly in half.
+
+Every run logs per-frame signal metrics (min/mean tone SNR, confidence, FEC
+status) and the ARQ carries the receiver's measured SNR back in the ACK, so
+rate/timing decisions are made from measurements. `--dump-rx` records raw
+audio for offline analysis, and `fsk_bench --diag` reports per-frame grid lock
+and symbol-level detail.
 
 ### New tooling (`sosw-tap`)
 

@@ -184,8 +184,9 @@ fn report_bank(a: &Args, cfg: &FskBankConfig, m: &Metrics) {
         0.0
     };
     let eff = goodput * (1.0 - m.per());
+    let cond = if m.decoded > 0 { m.valid as f32 / m.decoded as f32 * 100.0 } else { 0.0 };
     println!(
-        "BANK ch={} tones={} sym={}ms span={:.0}Hz hi={:.0}Hz raw={:.0}bps frames={} decoded={} valid={} PER={:.1}% minSNR={:.1}dB meanSNR={:.1}dB minConf={:.2} goodput={:.0}bps eff={:.0}bps",
+        "BANK ch={} tones={} sym={}ms span={:.0}Hz hi={:.0}Hz raw={:.0}bps sent={} decoded={} valid={} cond={:.0}% PER={:.1}% minSNR={:.1}dB meanSNR={:.1}dB minConf={:.2} goodput={:.0}bps eff={:.0}bps",
         cfg.n_channels,
         cfg.tones_per_channel,
         a.symbol_ms,
@@ -195,6 +196,7 @@ fn report_bank(a: &Args, cfg: &FskBankConfig, m: &Metrics) {
         m.sent,
         m.decoded,
         m.valid,
+        cond,
         m.per() * 100.0,
         m.min_snr_db,
         m.mean_snr_db,
@@ -223,6 +225,7 @@ fn run_bank(a: &Args, ps: &[Vec<u8>]) -> Result<()> {
                 script.len() as f32 / SR as f32,
                 cfg.highest_freq()
             );
+            println!("TOTAL_MS={}", (script.len() as f64 / SR as f64 * 1000.0) as u64);
             dev.play_blocking(&script, Duration::from_millis(200));
         }
         "rx" | "self" => {
@@ -371,14 +374,16 @@ fn report(a: &Args, cfg: &FskConfig, m: &Metrics, _rec_len: usize) {
         0.0
     };
     let eff = goodput * (1.0 - m.per());
+    let cond = if m.decoded > 0 { m.valid as f32 / m.decoded as f32 * 100.0 } else { 0.0 };
     println!(
-        "M={} sym={}ms raw={:.0}bps frames={} decoded={} valid={} PER={:.1}% minSNR={:.1}dB meanSNR={:.1}dB minConf={:.2} goodput={:.0}bps eff={:.0}bps",
+        "M={} sym={}ms raw={:.0}bps sent={} decoded={} valid={} cond={:.0}% PER={:.1}% minSNR={:.1}dB meanSNR={:.1}dB minConf={:.2} goodput={:.0}bps eff={:.0}bps",
         a.m,
         a.symbol_ms,
         cfg.raw_bps(),
         m.sent,
         m.decoded,
         m.valid,
+        cond,
         m.per() * 100.0,
         m.min_snr_db,
         m.mean_snr_db,
@@ -414,6 +419,7 @@ fn main() -> Result<()> {
         "tx" => {
             let dev = DuplexAudio::new(a.tx_device.as_deref(), a.rx_device.as_deref())?;
             eprintln!("playing {} frames ({:.1} s)", ps.len(), script.len() as f32 / SR as f32);
+            println!("TOTAL_MS={}", (script.len() as f64 / SR as f64 * 1000.0) as u64);
             dev.play_blocking(&script, Duration::from_millis(200));
         }
         "rx" | "self" => {
