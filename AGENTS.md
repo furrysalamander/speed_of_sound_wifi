@@ -98,6 +98,9 @@ cross-machine. See `README.md` → "Link Status" for the measured evidence. Olde
 "100% RS-correctable" acoustic tables below are **historical and not
 reproducible now**.
 
+The staged plan from here to a proven link (Ethernet deferred) is in
+`docs/link-development-plan.md`.
+
 ## Config Presets
 
 `data_symbols_per_frame` is matched to full FrameAssembler output (sync + RS-FEC + CRC, exact fit).

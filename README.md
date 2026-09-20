@@ -158,6 +158,9 @@ June 2026 and are **not reproducible now**, with either the Rust modem or the
 Python reference, in the current physical setup (the microphone was moved between
 then and now).
 
+The staged path from this state to a proven acoustic link (Ethernet deferred) is
+in [docs/link-development-plan.md](docs/link-development-plan.md).
+
 ## Config Presets
 
 Software and digital (monitor) loopbacks pass at 100%. Acoustic over-the-air
@@ -322,7 +325,8 @@ speed_of_sound_wifi/
 ├── AGENTS.md               # Development guide
 ├── PLAN.md                 # sosw-tap design document
 ├── docs/
-│   └── frequency_sweep.md  # Hardware frequency sweep analysis
+│   ├── frequency_sweep.md       # Hardware frequency sweep analysis
+│   └── link-development-plan.md # Staged plan from current state to a proven link
 │
 ├── sosw-core/              # Core OFDM modem library (no I/O)
 │   ├── Cargo.toml
