@@ -144,13 +144,21 @@ pub fn decode(audio: &[f32], cfg: &DtmfConfig) -> Vec<u8> {
         .map(|w| w.iter().map(|v| v * v).sum::<f32>())
         .collect();
 
-    // Noise-floor-relative threshold. Using a fraction of the loudest window
-    // would let one loud transient (e.g. our own echo) mask quieter symbols.
-    let max_e = env.iter().cloned().fold(0.0f32, f32::max).max(1e-12);
+    // Noise-floor-relative threshold from a low percentile, so it tracks the
+    // room level but ignores isolated loud transients (clicks, bumps, system
+    // sounds). An absolute-epsilon fallback only guards all-silent buffers;
+    // using a fraction of the *peak* here would let one spike blind the
+    // detector to every real symbol.
     let mut sorted = env.clone();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let p20 = sorted[sorted.len() / 5].max(max_e * 0.001);
+    let p20 = sorted[sorted.len() / 5].max(1e-12);
     let thr = p20 * 2.0;
+
+    // Hysteresis: start a region only on a clearly-above-floor window, but keep
+    // it going down to the floor. Without this, amplitude ripple and reverb
+    // fragment one message into many short regions, each of which re-anchors
+    // its own grid and misaligns.
+    let thr_start = (p20 * 8.0).max(thr);
 
     let period = cfg.symbol_samples + cfg.gap_samples;
     let half = cfg.symbol_samples / 2;
@@ -161,11 +169,16 @@ pub fn decode(audio: &[f32], cfg: &DtmfConfig) -> Vec<u8> {
     let gap_tol = (cfg.gap_samples / 2).max(1);
     let mut i = 0;
     while i < env.len() {
-        while i < env.len() && env[i] <= thr {
+        while i < env.len() && env[i] <= thr_start {
             i += 1;
         }
         if i >= env.len() {
             break;
+        }
+        // Back up to where the level first rose above the noise floor, so the
+        // region includes the leading edge of the first tone.
+        while i > 0 && env[i - 1] > thr {
+            i -= 1;
         }
         let region_start = i * env_win;
         // Extend the region while there is energy, tolerating short dips.
@@ -182,26 +195,52 @@ pub fn decode(audio: &[f32], cfg: &DtmfConfig) -> Vec<u8> {
         let region_end = ((last_active + 1) * env_win).min(audio.len());
         i = last_active + 1;
 
-        // Grid-decode this region: one sample per symbol period. Only accept
-        // the region if at least one slot looks like a genuine DTMF pair, so
-        // pure noise regions produce nothing.
-        let mut slots: Vec<(u8, f32)> = Vec::new();
-        let mut k = 0;
+        // Fine grid-phase search. The coarse region start is only known to
+        // within one envelope window (10 ms), which is negligible for a 100 ms
+        // symbol but not for a 30-40 ms one. Try sub-window offsets and keep
+        // the phase whose grid slots lock onto the tones most strongly.
+        let phase_step = (cfg.sample_rate as usize / 200).max(1); // 5 ms
+        let base = region_start.saturating_sub(env_win);
+        let search_end = region_start + env_win;
+        let mut best_score = f32::MIN;
+        let mut best_slots: Vec<(u8, f32)> = Vec::new();
+        let mut start = base;
         loop {
-            let center = region_start + half + k * period;
-            if center + half > region_end || center < half {
+            let mut slots: Vec<(u8, f32)> = Vec::new();
+            let mut k = 0;
+            loop {
+                let center = start + half + k * period;
+                if center + half > region_end {
+                    break;
+                }
+                let a = center.saturating_sub(half);
+                let b = (center + half).min(audio.len());
+                if b.saturating_sub(a) < cfg.symbol_samples / 2 {
+                    break;
+                }
+                if let Some((sym, conf)) = detect_symbol(&audio[a..b], cfg) {
+                    slots.push((sym, conf));
+                }
+                k += 1;
+            }
+            // Reward both how many slots lock on and how strong the best one is.
+            let score: f32 = slots.iter().map(|(_, c)| c).sum::<f32>()
+                + slots.iter().map(|(_, c)| *c).fold(0.0f32, f32::max);
+            if score > best_score {
+                best_score = score;
+                best_slots = slots;
+            }
+            if start >= search_end {
                 break;
             }
-            let a = center - half;
-            let b = center + half;
-            if let Some((sym, conf)) = detect_symbol(&audio[a..b], cfg) {
-                slots.push((sym, conf));
-            }
-            k += 1;
+            start = (start + phase_step).min(search_end);
         }
-        let best = slots.iter().map(|(_, c)| *c).fold(0.0f32, f32::max);
+
+        // Only accept the region if at least one slot looks like a genuine
+        // DTMF pair, so pure-noise regions produce nothing.
+        let best = best_slots.iter().map(|(_, c)| *c).fold(0.0f32, f32::max);
         if best >= 0.85 {
-            out.extend(slots.into_iter().map(|(s, _)| s));
+            out.extend(best_slots.into_iter().map(|(s, _)| s));
         }
     }
     out
@@ -233,6 +272,26 @@ pub fn bytes_to_nibbles(bytes: &[u8]) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    fn cfg_ms(symbol_ms: u32, gap_ms: u32) -> DtmfConfig {
+        DtmfConfig {
+            sample_rate: 48000,
+            symbol_samples: 48 * symbol_ms as usize,
+            gap_samples: 48 * gap_ms as usize,
+            amplitude: 0.4,
+        }
+    }
+
+    fn add_noise(audio: &mut [f32], rel: f32) {
+        let sig = audio.iter().map(|s| s * s).sum::<f32>() / audio.len().max(1) as f32;
+        let noise = (sig * rel).sqrt();
+        let mut rng = 0xC0FFEEu32;
+        for s in audio.iter_mut() {
+            rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
+            let n = ((rng >> 8) as f32 / 16_777_216.0) * 2.0 - 1.0;
+            *s += n * noise;
+        }
+    }
+
     #[test]
     fn test_symbol_roundtrip_clean() {
         let cfg = DtmfConfig::default();
@@ -240,6 +299,44 @@ mod tests {
         let audio = encode(&symbols, &cfg);
         let decoded = decode(&audio, &cfg);
         assert_eq!(decoded, symbols, "clean DTMF roundtrip failed");
+    }
+
+    /// The control channel does not need 100 ms symbols. Verify the grid phase
+    /// search makes shorter symbols work cleanly, including an exact-of-grid
+    /// capture offset (the acoustic latency) and noise.
+    #[test]
+    fn test_short_symbols_roundtrip() {
+        let symbols: Vec<u8> = (0..16).collect();
+        for (sym_ms, gap_ms) in [(60u32, 40u32), (40, 20), (30, 20), (20, 10)] {
+            let cfg = cfg_ms(sym_ms, gap_ms);
+            let audio = encode(&symbols, &cfg);
+            assert_eq!(
+                decode(&audio, &cfg),
+                symbols,
+                "clean {}ms/{}ms roundtrip failed",
+                sym_ms,
+                gap_ms
+            );
+        }
+    }
+
+    #[test]
+    fn test_short_symbols_offset_and_noise() {
+        let symbols: Vec<u8> = (0..16).collect();
+        for &(sym_ms, gap_ms) in &[(40u32, 20u32), (30, 20)] {
+            let cfg = cfg_ms(sym_ms, gap_ms);
+            let mut audio = vec![0.0f32; 777];
+            audio.extend(encode(&symbols, &cfg));
+            audio.extend(std::iter::repeat(0.0).take(3000));
+            add_noise(&mut audio, 0.02); // ~17 dB SNR
+            assert_eq!(
+                decode(&audio, &cfg),
+                symbols,
+                "{}ms/{}ms with offset+noise failed",
+                sym_ms,
+                gap_ms
+            );
+        }
     }
 
     #[test]

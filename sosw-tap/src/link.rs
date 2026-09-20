@@ -79,19 +79,28 @@ fn logical_nibbles(msg: &Message) -> [u8; 7] {
 /// checksum-valid frame, so inserted or dropped symbols do not desynchronize
 /// it as long as one clean copy survives.
 pub fn encode_message(msg: &Message, cfg: &dtmf::DtmfConfig) -> Vec<f32> {
-    let logical = logical_nibbles(msg);
-    let mut repeated = Vec::with_capacity(logical.len() * REPEAT);
-    for _ in 0..REPEAT {
-        repeated.extend_from_slice(&logical);
+    encode_message_repeat(msg, cfg, REPEAT)
+}
+
+/// Encode a message with an explicit repetition count, for tuning the control
+/// channel (fewer repeats = shorter, higher-rate messages).
+pub fn encode_message_repeat(msg: &Message, cfg: &dtmf::DtmfConfig, repeat: usize) -> Vec<f32> {
+    let mut repeated = Vec::with_capacity(logical_nibbles(msg).len() * repeat);
+    for _ in 0..repeat {
+        repeated.extend_from_slice(&logical_nibbles(msg));
     }
     dtmf::encode(&repeated, cfg)
 }
 
 /// The repeated symbol sequence for a message, for tests and diagnostics.
 pub fn encode_symbols(msg: &Message) -> Vec<u8> {
+    encode_symbols_repeat(msg, REPEAT)
+}
+
+pub fn encode_symbols_repeat(msg: &Message, repeat: usize) -> Vec<u8> {
     let logical = logical_nibbles(msg);
-    let mut out = Vec::with_capacity(logical.len() * REPEAT);
-    for _ in 0..REPEAT {
+    let mut out = Vec::with_capacity(logical.len() * repeat);
+    for _ in 0..repeat {
         out.extend_from_slice(&logical);
     }
     out
